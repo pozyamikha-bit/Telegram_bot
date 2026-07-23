@@ -33,6 +33,39 @@ STATUS_PENDING = "на модерации"
 STATUS_ACCEPTED = "принят"
 STATUS_REJECTED = "отклонён"
 
+TEXTS_HEADER = ["Ключ", "Текст"]
+
+# Тексты-автоответы по умолчанию. Их можно менять прямо из бота
+# (админ-панель -> "✏️ Тексты"), тогда значение сохраняется в лист
+# "Тексты" и берётся оттуда; если строки для ключа ещё нет — используется
+# значение по умолчанию отсюда.
+DEFAULT_TEXTS = {
+    "rules": (
+        "Правила акции:\n"
+        "1. Чек должен быть не старше 14 дней.\n"
+        "2. На фото должны быть видны дата и название товара.\n"
+        "3. Один чек — один купон Ozon."
+    ),
+    "ask_photo": (
+        "Пришлите ОДНО фото чека или УПД. "
+        "На фото должно быть видно дату и название товара."
+    ),
+    "registration_success": "Регистрация успешна! Теперь ты можешь отправлять чеки.",
+    "receipt_received": "Спасибо! Чек принят на модерацию. Ожидайте купон Ozon.",
+    "reject_message": "Плохое качество фото чека, просьба повторно зарегистрировать чек",
+    "accept_message": "Ваш чек принят! Ваш купон Ozon: {coupon}",
+}
+
+# Подписи для меню редактирования текстов в админ-панели.
+TEXT_LABELS = {
+    "rules": "Текст кнопки «Правила»",
+    "ask_photo": "Просьба прислать фото чека",
+    "registration_success": "Сообщение после успешной регистрации",
+    "receipt_received": "Ответ сразу после получения чека",
+    "reject_message": "Сообщение при отклонении кнопкой «Быстрое отклонение»",
+    "accept_message": "Сообщение при принятии чека (внутри можно оставить {coupon} — вместо него подставится номер купона)",
+}
+
 _client = None
 
 
@@ -219,3 +252,35 @@ def add_moderator(telegram_id: int, username: str, added_by: int):
 def remove_moderator(row_number: int):
     ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_MODERATORS, header=MODERATORS_HEADER)
     ws.delete_rows(row_number)
+
+
+# ---------- Редактируемые тексты-автоответы (доступно владельцам) ----------
+
+def get_all_texts():
+    """Возвращает словарь key -> текущий текст: из таблицы, если он там
+    задан и не пуст, иначе значение по умолчанию из DEFAULT_TEXTS."""
+    ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_TEXTS, header=TEXTS_HEADER)
+    records = ws.get_all_records()
+    overrides = {str(rec.get("Ключ", "")): str(rec.get("Текст", "")) for rec in records}
+
+    result = dict(DEFAULT_TEXTS)
+    for key, value in overrides.items():
+        if key in result and value:
+            result[key] = value
+    return result
+
+
+def get_text(key: str) -> str:
+    return get_all_texts().get(key, DEFAULT_TEXTS.get(key, ""))
+
+
+def set_text(key: str, value: str):
+    """Сохраняет новый текст для ключа: обновляет существующую строку
+    в листе "Тексты", либо добавляет новую, если ключа там ещё не было."""
+    ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_TEXTS, header=TEXTS_HEADER)
+    records = ws.get_all_records()
+    for i, rec in enumerate(records):
+        if str(rec.get("Ключ", "")) == key:
+            ws.update_cell(i + 2, 2, value)
+            return
+    ws.append_row([key, value])

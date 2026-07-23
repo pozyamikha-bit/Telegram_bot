@@ -68,6 +68,8 @@ class Form(StatesGroup):
 class AdminForm(StatesGroup):
     waiting_coupon = State()
     waiting_moderator_id = State()
+    waiting_text_value = State()
+    waiting_reject_reason = State()
 
 
 # ---------- Проверка прав доступа ----------
@@ -105,6 +107,7 @@ ADMIN_BTN_HISTORY = "🗓 История"
 ADMIN_BTN_MODERATION = "🛠 Модерация"
 ADMIN_BTN_MODERATORS = "👥 Модераторы"
 ADMIN_BTN_REPORT = "📊 Отчёт"
+ADMIN_BTN_TEXTS = "✏️ Тексты"
 ADMIN_BTN_EXIT = "⬅️ Выйти из панели"
 
 _main_menu_builder = ReplyKeyboardBuilder()
@@ -126,8 +129,9 @@ _owner_menu_builder.button(text=ADMIN_BTN_HISTORY)
 _owner_menu_builder.button(text=ADMIN_BTN_MODERATION)
 _owner_menu_builder.button(text=ADMIN_BTN_REPORT)
 _owner_menu_builder.button(text=ADMIN_BTN_MODERATORS)
+_owner_menu_builder.button(text=ADMIN_BTN_TEXTS)
 _owner_menu_builder.button(text=ADMIN_BTN_EXIT)
-_owner_menu_builder.adjust(2, 2, 1)
+_owner_menu_builder.adjust(2, 2, 2)
 owner_menu = _owner_menu_builder.as_markup(resize_keyboard=True)
 
 
@@ -212,7 +216,7 @@ async def process_phone(message: Message, state: FSMContext):
 
     await state.clear()
     await message.answer(
-        "Регистрация успешна! Теперь ты можешь отправлять чеки.",
+        google_sheets.get_text("registration_success"),
         reply_markup=main_menu,
     )
 
@@ -221,13 +225,7 @@ async def process_phone(message: Message, state: FSMContext):
 
 @dp.message(F.text == BTN_RULES)
 async def show_rules(message: Message):
-    await message.answer(
-        "Правила акции:\n"
-        "1. Чек должен быть не старше 14 дней.\n"
-        "2. На фото должны быть видны дата и название товара.\n"
-        "3. Один чек — один купон Ozon.\n\n"
-        "(Отредактируйте этот текст под условия своей акции.)"
-    )
+    await message.answer(google_sheets.get_text("rules"))
 
 
 # ---------- Приём чеков ----------
@@ -235,10 +233,7 @@ async def show_rules(message: Message):
 @dp.message(F.text == BTN_SEND_RECEIPT)
 async def send_receipt_start(message: Message, state: FSMContext):
     await state.set_state(Form.waiting_photo)
-    await message.answer(
-        "Пришлите ОДНО фото чека или УПД. "
-        "На фото должно быть видно дату и название товара."
-    )
+    await message.answer(google_sheets.get_text("ask_photo"))
 
 
 @dp.message(StateFilter(Form.waiting_photo), F.photo)
@@ -267,7 +262,7 @@ async def process_photo(message: Message, state: FSMContext):
 
     await state.clear()
     await message.answer(
-        "Спасибо! Чек принят на модерацию. Ожидайте купон Ozon.",
+        google_sheets.get_text("receipt_received"),
         reply_markup=main_menu,
     )
 
@@ -303,10 +298,15 @@ async def _send_receipt_card(message: Message, receipt: dict, with_moderation_bu
     reply_markup = None
     if with_moderation_buttons:
         kb = InlineKeyboardBuilder()
-        kb.row(
-            InlineKeyboardButton(text="✅ Принять", callback_data=f"mod_accept:{receipt['row']}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"mod_reject:{receipt['row']}"),
-        )
+        kb.row(InlineKeyboardButton(text="✅ Принять", callback_data=f"mod_accept:{receipt['row']}"))
+        kb.row(InlineKeyboardButton(
+            text="⚡ Быстрое отклонение",
+            callback_data=f"mod_reject_photo:{receipt['row']}",
+        ))
+        kb.row(InlineKeyboardButton(
+            text="💬 Отклонить с комментарием",
+            callback_data=f"mod_reject_custom:{receipt['row']}",
+        ))
         reply_markup = kb.as_markup()
 
     if receipt["file_id"]:
@@ -451,33 +451,62 @@ async def admin_moderation_view(call: CallbackQuery):
     await call.answer()
 
 
-@dp.callback_query(F.data.startswith("mod_reject:"), IsModerator())
-async def admin_moderation_reject(call: CallbackQuery):
-    row = int(call.data.split(":", 1)[1])
+async def _reject_receipt(row: int, reason_text: str):
+    """Ставит чеку статус 'отклонён' и уведомляет пользователя причиной.
+    Возвращает (True, None) при успехе или (False, текст_ошибки)."""
     receipt = google_sheets.get_receipt_by_row(row)
     if not receipt:
-        await call.answer("Не найдено", show_alert=True)
-        return
+        return False, "Не найдено."
 
     try:
         google_sheets.update_receipt_status(row, google_sheets.STATUS_REJECTED)
     except Exception:
         logger.exception("Не удалось обновить статус чека")
-        await call.message.answer("Не получилось обновить таблицу, попробуйте ещё раз.")
-        await call.answer()
-        return
+        return False, "Не получилось обновить таблицу, попробуйте ещё раз."
 
     try:
-        await bot.send_message(
-            receipt["telegram_id"],
-            "К сожалению, ваш чек отклонён. Если считаете, что это ошибка, "
-            "свяжитесь с организатором акции.",
-        )
+        await bot.send_message(receipt["telegram_id"], reason_text)
     except Exception:
         logger.exception("Не удалось уведомить пользователя об отклонении")
 
-    await call.message.answer("Чек отклонён, пользователь уведомлён.")
+    return True, None
+
+
+@dp.callback_query(F.data.startswith("mod_reject_photo:"), IsModerator())
+async def admin_moderation_reject_photo(call: CallbackQuery):
+    row = int(call.data.split(":", 1)[1])
+    ok, error = await _reject_receipt(row, google_sheets.get_text("reject_message"))
+    if not ok:
+        await call.answer(error, show_alert=True)
+        return
+    await call.message.answer("Чек отклонён (быстрое отклонение), пользователь уведомлён.")
     await call.answer()
+
+
+@dp.callback_query(F.data.startswith("mod_reject_custom:"), IsModerator())
+async def admin_moderation_reject_custom_start(call: CallbackQuery, state: FSMContext):
+    row = int(call.data.split(":", 1)[1])
+    await state.set_state(AdminForm.waiting_reject_reason)
+    await state.update_data(moderation_row=row)
+    await call.message.answer(
+        "Введите причину отклонения одним сообщением — она будет отправлена пользователю."
+    )
+    await call.answer()
+
+
+@dp.message(StateFilter(AdminForm.waiting_reject_reason), IsModerator())
+async def admin_moderation_reject_custom_finish(message: Message, state: FSMContext):
+    data = await state.get_data()
+    row = data.get("moderation_row")
+
+    ok, error = await _reject_receipt(row, message.text)
+    await state.clear()
+
+    menu = _menu_for(message.from_user.id)
+    if not ok:
+        await message.answer(error, reply_markup=menu)
+        return
+    await message.answer("Чек отклонён, пользователь уведомлён.", reply_markup=menu)
 
 
 @dp.callback_query(F.data.startswith("mod_accept:"), IsModerator())
@@ -510,7 +539,14 @@ async def admin_moderation_accept_finish(message: Message, state: FSMContext):
         return
 
     try:
-        await bot.send_message(receipt["telegram_id"], f"Ваш чек принят! Ваш купон Ozon: {coupon}")
+        accept_text_template = google_sheets.get_text("accept_message")
+        try:
+            accept_text = accept_text_template.format(coupon=coupon)
+        except Exception:
+            logger.exception("Не удалось подставить купон в шаблон сообщения, использую текст по умолчанию")
+            accept_text = f"Ваш чек принят! Ваш купон Ozon: {coupon}"
+
+        await bot.send_message(receipt["telegram_id"], accept_text)
         await message.answer("Купон отправлен пользователю, статус обновлён.", reply_markup=_menu_for(message.from_user.id))
     except Exception:
         logger.exception("Не удалось отправить купон пользователю")
@@ -596,6 +632,55 @@ async def admin_moderator_delete(call: CallbackQuery):
         logger.exception("Не удалось удалить модератора")
         await call.message.answer("Не получилось удалить, попробуйте ещё раз.")
     await call.answer()
+
+
+# ---------- Редактирование текстов-автоответов (только владельцы) ----------
+
+@dp.message(F.text == ADMIN_BTN_TEXTS, IsOwner())
+async def admin_texts_menu(message: Message):
+    builder = InlineKeyboardBuilder()
+    for key, label in google_sheets.TEXT_LABELS.items():
+        builder.row(InlineKeyboardButton(text=label, callback_data=f"text_edit:{key}"))
+    await message.answer("Какой текст изменить?", reply_markup=builder.as_markup())
+
+
+@dp.callback_query(F.data.startswith("text_edit:"), IsOwner())
+async def admin_text_edit_start(call: CallbackQuery, state: FSMContext):
+    key = call.data.split(":", 1)[1]
+    label = google_sheets.TEXT_LABELS.get(key, key)
+
+    try:
+        current = google_sheets.get_text(key)
+    except Exception:
+        logger.exception("Не удалось прочитать текущий текст")
+        await call.message.answer("Не получилось прочитать данные из таблицы, попробуйте ещё раз.")
+        await call.answer()
+        return
+
+    await state.set_state(AdminForm.waiting_text_value)
+    await state.update_data(text_key=key)
+    await call.message.answer(
+        f"«{label}»\n\nТекущий текст:\n{current}\n\nПришлите новый текст одним сообщением."
+    )
+    await call.answer()
+
+
+@dp.message(StateFilter(AdminForm.waiting_text_value), IsOwner())
+async def admin_text_edit_finish(message: Message, state: FSMContext):
+    data = await state.get_data()
+    key = data.get("text_key")
+    new_value = message.text
+
+    try:
+        google_sheets.set_text(key, new_value)
+    except Exception:
+        logger.exception("Не удалось сохранить текст")
+        await message.answer("Не получилось сохранить в таблицу, попробуйте ещё раз.")
+        await state.clear()
+        return
+
+    await state.clear()
+    await message.answer("Готово, текст обновлён.", reply_markup=owner_menu)
 
 
 # ---------- Отчёт в Excel ----------
