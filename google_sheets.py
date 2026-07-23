@@ -6,6 +6,7 @@
 import datetime
 import json
 import logging
+import time
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -67,6 +68,18 @@ TEXT_LABELS = {
 }
 
 _client = None
+_spreadsheet = None
+_worksheet_cache = {}  # sheet_name -> gspread.Worksheet
+
+# Короткий кэш результатов get_all_records() на лист, чтобы не делать
+# отдельный запрос к Google Sheets API на каждое обращение к данным.
+# Это и есть главная причина ошибки 429 (RESOURCE_EXHAUSTED /
+# RATE_LIMIT_EXCEEDED, лимит 60 запросов на чтение в минуту): без кэша
+# один только показ списка чеков в "Истории"/"Модерации" делал отдельный
+# запрос на КАЖДЫЙ чек (чтобы найти его регистрацию), и лимит выбирался
+# за несколько нажатий кнопок.
+_RECORDS_CACHE_TTL_SECONDS = 8
+_records_cache = {}  # sheet_name -> (timestamp, records)
 
 
 def _get_client():
@@ -85,18 +98,49 @@ def _get_client():
     return _client
 
 
+def _get_spreadsheet():
+    global _spreadsheet
+    if _spreadsheet is None:
+        client = _get_client()
+        _spreadsheet = client.open_by_key(config.GOOGLE_SHEET_ID)
+    return _spreadsheet
+
+
 def _get_worksheet(sheet_name: str, header=None):
-    client = _get_client()
-    spreadsheet = client.open_by_key(config.GOOGLE_SHEET_ID)
+    if sheet_name in _worksheet_cache:
+        return _worksheet_cache[sheet_name]
+
+    spreadsheet = _get_spreadsheet()
     try:
-        return spreadsheet.worksheet(sheet_name)
+        ws = spreadsheet.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
         # Если листа с таким названием ещё нет в таблице - создаём его сам
         logger.info("Лист '%s' не найден, создаю новый", sheet_name)
         ws = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=10)
         if header:
             ws.append_row(header)
-        return ws
+    _worksheet_cache[sheet_name] = ws
+    return ws
+
+
+def _get_records(sheet_name: str, header=None):
+    """get_all_records() с коротким кэшем (несколько секунд) — резко
+    уменьшает число обращений к Google Sheets API при показе списков."""
+    cached = _records_cache.get(sheet_name)
+    now = time.time()
+    if cached is not None and (now - cached[0]) < _RECORDS_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    ws = _get_worksheet(sheet_name, header=header)
+    records = ws.get_all_records()
+    _records_cache[sheet_name] = (now, records)
+    return records
+
+
+def _invalidate_records_cache(sheet_name: str):
+    """Вызывается после любой записи в лист, чтобы следующее чтение сразу
+    видело новые данные, а не отдавало устаревшие из кэша."""
+    _records_cache.pop(sheet_name, None)
 
 
 # ---------- Запись данных (используется в основном сценарии бота) ----------
@@ -112,6 +156,7 @@ def append_registration(full_name: str, shop: str, phone: str, telegram_id: int,
         str(telegram_id),
         username or "",
     ])
+    _invalidate_records_cache(config.GOOGLE_SHEET_WORKSHEET_REG)
 
 
 def append_receipt(telegram_id: int, username: str, file_id: str, file_name: str):
@@ -128,14 +173,14 @@ def append_receipt(telegram_id: int, username: str, file_id: str, file_name: str
         "",
         "",
     ])
+    _invalidate_records_cache(config.GOOGLE_SHEET_WORKSHEET_RECEIPTS)
 
 
 # ---------- Чтение и обновление данных (используется в админ-панели) ----------
 
 def get_all_registrations():
     """Возвращает все регистрации списком словарей (для выгрузки отчёта)."""
-    ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_REG, header=REGISTRATION_HEADER)
-    records = ws.get_all_records()
+    records = _get_records(config.GOOGLE_SHEET_WORKSHEET_REG, header=REGISTRATION_HEADER)
     result = []
     for rec in records:
         result.append({
@@ -152,8 +197,7 @@ def get_all_registrations():
 def get_registration_by_telegram_id(telegram_id):
     """Возвращает последнюю регистрацию пользователя с данным Telegram ID
     в виде {"full_name", "shop", "phone"} или None, если не найдено."""
-    ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_REG, header=REGISTRATION_HEADER)
-    records = ws.get_all_records()
+    records = _get_records(config.GOOGLE_SHEET_WORKSHEET_REG, header=REGISTRATION_HEADER)
     telegram_id = str(telegram_id)
     for rec in reversed(records):
         if str(rec.get("Telegram ID", "")) == telegram_id:
@@ -168,8 +212,7 @@ def get_registration_by_telegram_id(telegram_id):
 def get_receipts():
     """Возвращает все чеки списком словарей с ключом 'row' — номером строки
     в таблице (нужен, чтобы потом обновить именно эту строку)."""
-    ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_RECEIPTS, header=RECEIPTS_HEADER)
-    records = ws.get_all_records()
+    records = _get_records(config.GOOGLE_SHEET_WORKSHEET_RECEIPTS, header=RECEIPTS_HEADER)
     result = []
     for i, rec in enumerate(records):
         result.append({
@@ -214,6 +257,7 @@ def mark_receipt_deleted(row_number: int, deleted: bool = True):
     ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_RECEIPTS, header=RECEIPTS_HEADER)
     deleted_col = RECEIPTS_HEADER.index("Удалён") + 1
     ws.update_cell(row_number, deleted_col, "да" if deleted else "")
+    _invalidate_records_cache(config.GOOGLE_SHEET_WORKSHEET_RECEIPTS)
 
 
 
@@ -229,14 +273,14 @@ def update_receipt_status(row_number: int, status: str, coupon: str = None, comm
     if comment is not None:
         comment_col = RECEIPTS_HEADER.index("Комментарий") + 1
         ws.update_cell(row_number, comment_col, comment)
+    _invalidate_records_cache(config.GOOGLE_SHEET_WORKSHEET_RECEIPTS)
 
 
 # ---------- Управление модераторами (доступно только владельцам, ADMIN_IDS) ----------
 
 def get_moderators():
     """Возвращает список модераторов вида {row, telegram_id, username, added_by, date}."""
-    ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_MODERATORS, header=MODERATORS_HEADER)
-    records = ws.get_all_records()
+    records = _get_records(config.GOOGLE_SHEET_WORKSHEET_MODERATORS, header=MODERATORS_HEADER)
     result = []
     for i, rec in enumerate(records):
         result.append({
@@ -268,11 +312,13 @@ def add_moderator(telegram_id: int, username: str, added_by: int):
         str(added_by),
         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     ])
+    _invalidate_records_cache(config.GOOGLE_SHEET_WORKSHEET_MODERATORS)
 
 
 def remove_moderator(row_number: int):
     ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_MODERATORS, header=MODERATORS_HEADER)
     ws.delete_rows(row_number)
+    _invalidate_records_cache(config.GOOGLE_SHEET_WORKSHEET_MODERATORS)
 
 
 # ---------- Редактируемые тексты-автоответы (доступно владельцам) ----------
@@ -280,8 +326,7 @@ def remove_moderator(row_number: int):
 def get_all_texts():
     """Возвращает словарь key -> текущий текст: из таблицы, если он там
     задан и не пуст, иначе значение по умолчанию из DEFAULT_TEXTS."""
-    ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_TEXTS, header=TEXTS_HEADER)
-    records = ws.get_all_records()
+    records = _get_records(config.GOOGLE_SHEET_WORKSHEET_TEXTS, header=TEXTS_HEADER)
     overrides = {str(rec.get("Ключ", "")): str(rec.get("Текст", "")) for rec in records}
 
     result = dict(DEFAULT_TEXTS)
@@ -300,8 +345,11 @@ def set_text(key: str, value: str):
     в листе "Тексты", либо добавляет новую, если ключа там ещё не было."""
     ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_TEXTS, header=TEXTS_HEADER)
     records = ws.get_all_records()
-    for i, rec in enumerate(records):
-        if str(rec.get("Ключ", "")) == key:
-            ws.update_cell(i + 2, 2, value)
-            return
-    ws.append_row([key, value])
+    try:
+        for i, rec in enumerate(records):
+            if str(rec.get("Ключ", "")) == key:
+                ws.update_cell(i + 2, 2, value)
+                return
+        ws.append_row([key, value])
+    finally:
+        _invalidate_records_cache(config.GOOGLE_SHEET_WORKSHEET_TEXTS)
