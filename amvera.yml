@@ -1,0 +1,23 @@
+# Черновой конфиг для деплоя на Amvera.
+#
+# ВАЖНО: перед использованием сверьте его с актуальным генератором
+# конфигурации на https://manifest.amvera.ru/ — формат мог измениться.
+# Обычно Amvera создаёт такой файл автоматически при первом деплое
+# через панель, так что этот файл — не обязательно жёсткая истина,
+# а отправная точка.
+
+meta:
+  environment: python
+  toolchain:
+    name: pip
+    version: "3.11"
+
+build:
+  requirementsPath: requirements.txt
+
+run:
+  scriptName: bot.py
+  persistenceMount: /data
+  env:
+    - name: PYTHONUNBUFFERED
+      value: "1"
