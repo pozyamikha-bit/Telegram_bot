@@ -202,6 +202,12 @@ def get_receipt_by_row(row_number: int):
     return None
 
 
+def delete_receipt(row_number: int):
+    """Полностью удаляет строку чека из листа 'Чеки' (действие необратимо)."""
+    ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_RECEIPTS, header=RECEIPTS_HEADER)
+    ws.delete_rows(row_number)
+
+
 def update_receipt_status(row_number: int, status: str, coupon: str = None, comment: str = None):
     """Обновляет статус чека и, опционально, номер купона и/или комментарий
     модератора (например, причину отклонения) по номеру строки."""

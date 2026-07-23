@@ -274,7 +274,12 @@ async def wrong_content_for_photo(message: Message):
 
 # ---------- Общая карточка чека (используется и в Истории, и в Модерации) ----------
 
-async def _send_receipt_card(message: Message, receipt: dict, with_moderation_buttons: bool = False):
+async def _send_receipt_card(
+    message: Message,
+    receipt: dict,
+    with_moderation_buttons: bool = False,
+    with_history_buttons: bool = False,
+):
     reg = google_sheets.get_registration_by_telegram_id(receipt["telegram_id"])
 
     lines = []
@@ -309,6 +314,13 @@ async def _send_receipt_card(message: Message, receipt: dict, with_moderation_bu
             text="💬 Отклонить с комментарием",
             callback_data=f"mod_reject_custom:{receipt['row']}",
         ))
+        reply_markup = kb.as_markup()
+    elif with_history_buttons:
+        kb = InlineKeyboardBuilder()
+        kb.row(InlineKeyboardButton(text="🗑 Удалить чек", callback_data=f"hist_delete:{receipt['row']}"))
+        date_str = receipt["date"][:10] if receipt.get("date") else ""
+        if date_str:
+            kb.row(InlineKeyboardButton(text="⬅️ Назад к списку", callback_data=f"cal_day:{date_str}"))
         reply_markup = kb.as_markup()
 
     if receipt["file_id"]:
@@ -399,21 +411,18 @@ async def admin_calendar_nav(call: CallbackQuery):
     await call.answer()
 
 
-@dp.callback_query(F.data.startswith("cal_day:"), IsModerator())
-async def admin_calendar_pick_day(call: CallbackQuery):
-    _, date_str = call.data.split(":", 1)
-
+async def _send_day_receipt_list(message: Message, date_str: str):
+    """Показывает список чеков за дату — используется и при выборе даты в
+    календаре, и как "Назад" из карточки чека, и после удаления чека."""
     try:
         receipts = google_sheets.get_receipts_by_date(date_str)
     except Exception:
         logger.exception("Не удалось получить чеки за дату")
-        await call.message.answer("Не получилось прочитать данные из таблицы, попробуйте ещё раз.")
-        await call.answer()
+        await message.answer("Не получилось прочитать данные из таблицы, попробуйте ещё раз.")
         return
 
     if not receipts:
-        await call.message.answer(f"На {date_str} чеков нет.")
-        await call.answer()
+        await message.answer(f"На {date_str} чеков нет.")
         return
 
     builder = InlineKeyboardBuilder()
@@ -424,7 +433,13 @@ async def admin_calendar_pick_day(call: CallbackQuery):
             text=f"{time_part} — {label} ({r['status']})",
             callback_data=f"hist_view:{r['row']}",
         ))
-    await call.message.answer(f"Чеки за {date_str}:", reply_markup=builder.as_markup())
+    await message.answer(f"Чеки за {date_str}:", reply_markup=builder.as_markup())
+
+
+@dp.callback_query(F.data.startswith("cal_day:"), IsModerator())
+async def admin_calendar_pick_day(call: CallbackQuery):
+    _, date_str = call.data.split(":", 1)
+    await _send_day_receipt_list(call.message, date_str)
     await call.answer()
 
 
@@ -435,7 +450,60 @@ async def admin_history_view(call: CallbackQuery):
     if not receipt:
         await call.answer("Не найдено", show_alert=True)
         return
-    await _send_receipt_card(call.message, receipt, with_moderation_buttons=False)
+    await _send_receipt_card(call.message, receipt, with_history_buttons=True)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("hist_delete:"), IsModerator())
+async def admin_history_delete_confirm(call: CallbackQuery):
+    row = int(call.data.split(":", 1)[1])
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"hist_delete_yes:{row}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="hist_delete_no"),
+    )
+    await call.message.answer(
+        "Точно удалить этот чек из таблицы? Действие необратимо.",
+        reply_markup=kb.as_markup(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "hist_delete_no", IsModerator())
+async def admin_history_delete_cancel(call: CallbackQuery):
+    await call.message.answer("Отменено, чек не удалён.")
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("hist_delete_yes:"), IsModerator())
+async def admin_history_delete_do(call: CallbackQuery):
+    row = int(call.data.split(":", 1)[1])
+    receipt = google_sheets.get_receipt_by_row(row)
+    if not receipt:
+        await call.answer("Уже удалено или не найдено.", show_alert=True)
+        return
+
+    date_str = receipt["date"][:10] if receipt.get("date") else ""
+
+    try:
+        google_sheets.delete_receipt(row)
+    except Exception:
+        logger.exception("Не удалось удалить чек")
+        await call.message.answer("Не получилось удалить, попробуйте ещё раз.")
+        await call.answer()
+        return
+
+    # Пробуем подчистить и файл на диске — не критично, если не получится
+    file_name = receipt.get("file_name") or ""
+    if file_name and os.path.isfile(file_name):
+        try:
+            os.remove(file_name)
+        except Exception:
+            logger.exception("Не удалось удалить файл фото с диска (не критично)")
+
+    await call.message.answer("Чек удалён из таблицы.")
+    if date_str:
+        await _send_day_receipt_list(call.message, date_str)
     await call.answer()
 
 
