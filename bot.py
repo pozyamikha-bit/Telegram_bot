@@ -292,6 +292,8 @@ async def _send_receipt_card(message: Message, receipt: dict, with_moderation_bu
     lines.append(f"Статус: {receipt['status']}")
     if receipt.get("coupon"):
         lines.append(f"Купон: {receipt['coupon']}")
+    if receipt.get("comment"):
+        lines.append(f"Комментарий: {receipt['comment']}")
 
     caption = "\n".join(lines)
 
@@ -317,6 +319,21 @@ async def _send_receipt_card(message: Message, receipt: dict, with_moderation_bu
             logger.exception("Не удалось отправить фото чека администратору")
 
     await message.answer(caption, reply_markup=reply_markup)
+
+
+def _format_receipt_label(r: dict) -> str:
+    """Короткая подпись для кнопки в списке чеков: имя (или ID), магазин,
+    username — обрезается, чтобы уложиться в лимит длины текста кнопки."""
+    reg = google_sheets.get_registration_by_telegram_id(r["telegram_id"])
+    name = reg["full_name"] if reg else f"ID {r['telegram_id']}"
+    shop = reg.get("shop") if reg else ""
+    username = f"@{r['username']}" if r.get("username") else ""
+
+    parts = [p for p in [name, shop, username] if p]
+    label = " · ".join(parts)
+    if len(label) > 34:
+        label = label[:33] + "…"
+    return label
 
 
 # ---------- История: календарь ----------
@@ -395,8 +412,7 @@ async def admin_calendar_pick_day(call: CallbackQuery):
 
     builder = InlineKeyboardBuilder()
     for r in receipts:
-        reg = google_sheets.get_registration_by_telegram_id(r["telegram_id"])
-        label = (reg["full_name"] if reg else f"ID {r['telegram_id']}")[:24]
+        label = _format_receipt_label(r)
         time_part = r["date"][11:16] if len(r["date"]) >= 16 else r["date"]
         builder.row(InlineKeyboardButton(
             text=f"{time_part} — {label} ({r['status']})",
@@ -434,8 +450,7 @@ async def admin_moderation_start(message: Message):
 
     builder = InlineKeyboardBuilder()
     for r in receipts:
-        reg = google_sheets.get_registration_by_telegram_id(r["telegram_id"])
-        label = (reg["full_name"] if reg else f"ID {r['telegram_id']}")[:24]
+        label = _format_receipt_label(r)
         builder.row(InlineKeyboardButton(text=f"{r['date']} — {label}", callback_data=f"mod_view:{r['row']}"))
     await message.answer("Чеки на модерации:", reply_markup=builder.as_markup())
 
@@ -459,7 +474,7 @@ async def _reject_receipt(row: int, reason_text: str):
         return False, "Не найдено."
 
     try:
-        google_sheets.update_receipt_status(row, google_sheets.STATUS_REJECTED)
+        google_sheets.update_receipt_status(row, google_sheets.STATUS_REJECTED, comment=reason_text)
     except Exception:
         logger.exception("Не удалось обновить статус чека")
         return False, "Не получилось обновить таблицу, попробуйте ещё раз."
@@ -605,8 +620,25 @@ async def admin_moderator_add_finish(message: Message, state: FSMContext):
         return
 
     new_id = int(text)
+
+    # Username нельзя узнать из одного только введённого числа — пробуем
+    # спросить у Telegram напрямую. Это сработает, только если новый
+    # модератор уже хотя бы раз писал этому боту раньше (иначе Telegram
+    # не отдаёт информацию о чате) — если нет, username останется пустым,
+    # это не критично: права проверяются по Telegram ID, а не по username.
+    username = ""
     try:
-        google_sheets.add_moderator(new_id, username="", added_by=message.from_user.id)
+        chat = await bot.get_chat(new_id)
+        username = chat.username or ""
+    except Exception:
+        logger.info(
+            "Не удалось получить username для %s (скорее всего, он ещё не писал боту) — "
+            "сохраняю без username",
+            new_id,
+        )
+
+    try:
+        google_sheets.add_moderator(new_id, username=username, added_by=message.from_user.id)
     except Exception:
         logger.exception("Не удалось добавить модератора")
         await message.answer("Не получилось сохранить в таблицу, попробуйте ещё раз.")
@@ -698,7 +730,7 @@ def _build_report_workbook() -> io.BytesIO:
 
     ws_receipts = wb.active
     ws_receipts.title = "Чеки"
-    receipt_headers = ["Дата", "Telegram ID", "Username", "ФИО", "Магазин", "Телефон", "Статус", "Купон"]
+    receipt_headers = ["Дата", "Telegram ID", "Username", "ФИО", "Магазин", "Телефон", "Статус", "Купон", "Комментарий"]
     ws_receipts.append(receipt_headers)
     for r in google_sheets.get_receipts():
         reg = reg_by_id.get(r["telegram_id"])
@@ -711,6 +743,7 @@ def _build_report_workbook() -> io.BytesIO:
             reg["phone"] if reg else "",
             r["status"],
             r["coupon"],
+            r["comment"],
         ])
     _autosize(ws_receipts, receipt_headers)
 

@@ -26,7 +26,7 @@ SCOPES = [
 # добавьте эту строку первой строкой в лист вручную в Google Sheets,
 # иначе первая строка с данными будет ошибочно принята за заголовок.
 REGISTRATION_HEADER = ["Дата регистрации", "ФИО", "Магазин", "Телефон", "Telegram ID", "Username"]
-RECEIPTS_HEADER = ["Дата", "Telegram ID", "Username", "File ID", "Файл", "Статус", "Купон"]
+RECEIPTS_HEADER = ["Дата", "Telegram ID", "Username", "File ID", "Файл", "Статус", "Купон", "Комментарий"]
 MODERATORS_HEADER = ["Telegram ID", "Username", "Добавил (ID)", "Дата добавления"]
 
 STATUS_PENDING = "на модерации"
@@ -125,6 +125,7 @@ def append_receipt(telegram_id: int, username: str, file_id: str, file_name: str
         file_name,
         STATUS_PENDING,
         "",
+        "",
     ])
 
 
@@ -179,6 +180,7 @@ def get_receipts():
             "file_name": str(rec.get("Файл", "")),
             "status": str(rec.get("Статус", "")),
             "coupon": str(rec.get("Купон", "")),
+            "comment": str(rec.get("Комментарий", "")),
         })
     return result
 
@@ -200,14 +202,18 @@ def get_receipt_by_row(row_number: int):
     return None
 
 
-def update_receipt_status(row_number: int, status: str, coupon: str = None):
-    """Обновляет статус чека (и, опционально, номер купона) по номеру строки."""
+def update_receipt_status(row_number: int, status: str, coupon: str = None, comment: str = None):
+    """Обновляет статус чека и, опционально, номер купона и/или комментарий
+    модератора (например, причину отклонения) по номеру строки."""
     ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_RECEIPTS, header=RECEIPTS_HEADER)
     status_col = RECEIPTS_HEADER.index("Статус") + 1
     ws.update_cell(row_number, status_col, status)
     if coupon is not None:
         coupon_col = RECEIPTS_HEADER.index("Купон") + 1
         ws.update_cell(row_number, coupon_col, coupon)
+    if comment is not None:
+        comment_col = RECEIPTS_HEADER.index("Комментарий") + 1
+        ws.update_cell(row_number, comment_col, comment)
 
 
 # ---------- Управление модераторами (доступно только владельцам, ADMIN_IDS) ----------
