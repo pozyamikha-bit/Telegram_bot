@@ -283,6 +283,8 @@ async def _send_receipt_card(
     reg = google_sheets.get_registration_by_telegram_id(receipt["telegram_id"])
 
     lines = []
+    if receipt.get("deleted"):
+        lines.append("🗑 Помечен как удалённый")
     if reg:
         lines.append(f"ФИО: {reg['full_name']}")
         lines.append(f"Магазин: {reg['shop']}")
@@ -486,22 +488,17 @@ async def admin_history_delete_do(call: CallbackQuery):
     date_str = receipt["date"][:10] if receipt.get("date") else ""
 
     try:
-        google_sheets.delete_receipt(row)
+        google_sheets.mark_receipt_deleted(row)
     except Exception:
-        logger.exception("Не удалось удалить чек")
-        await call.message.answer("Не получилось удалить, попробуйте ещё раз.")
+        logger.exception("Не удалось пометить чек как удалённый")
+        await call.message.answer("Не получилось обновить таблицу, попробуйте ещё раз.")
         await call.answer()
         return
 
-    # Пробуем подчистить и файл на диске — не критично, если не получится
-    file_name = receipt.get("file_name") or ""
-    if file_name and os.path.isfile(file_name):
-        try:
-            os.remove(file_name)
-        except Exception:
-            logger.exception("Не удалось удалить файл фото с диска (не критично)")
-
-    await call.message.answer("Чек удалён из таблицы.")
+    await call.message.answer(
+        "Чек помечен как удалённый и больше не будет виден в списках. "
+        "Сама запись и фото остаются в таблице/на диске."
+    )
     if date_str:
         await _send_day_receipt_list(call.message, date_str)
     await call.answer()
@@ -804,7 +801,10 @@ def _build_report_workbook() -> io.BytesIO:
 
     ws_receipts = wb.active
     ws_receipts.title = "Чеки"
-    receipt_headers = ["Дата", "Telegram ID", "Username", "ФИО", "Магазин", "Телефон", "Статус", "Купон", "Комментарий"]
+    receipt_headers = [
+        "Дата", "Telegram ID", "Username", "ФИО", "Магазин", "Телефон",
+        "Статус", "Купон", "Комментарий", "Удалён",
+    ]
     ws_receipts.append(receipt_headers)
     for r in google_sheets.get_receipts():
         reg = reg_by_id.get(r["telegram_id"])
@@ -818,6 +818,7 @@ def _build_report_workbook() -> io.BytesIO:
             r["status"],
             r["coupon"],
             r["comment"],
+            "да" if r["deleted"] else "",
         ])
     _autosize(ws_receipts, receipt_headers)
 

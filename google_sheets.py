@@ -26,7 +26,7 @@ SCOPES = [
 # добавьте эту строку первой строкой в лист вручную в Google Sheets,
 # иначе первая строка с данными будет ошибочно принята за заголовок.
 REGISTRATION_HEADER = ["Дата регистрации", "ФИО", "Магазин", "Телефон", "Telegram ID", "Username"]
-RECEIPTS_HEADER = ["Дата", "Telegram ID", "Username", "File ID", "Файл", "Статус", "Купон", "Комментарий"]
+RECEIPTS_HEADER = ["Дата", "Telegram ID", "Username", "File ID", "Файл", "Статус", "Купон", "Комментарий", "Удалён"]
 MODERATORS_HEADER = ["Telegram ID", "Username", "Добавил (ID)", "Дата добавления"]
 
 STATUS_PENDING = "на модерации"
@@ -126,6 +126,7 @@ def append_receipt(telegram_id: int, username: str, file_id: str, file_name: str
         STATUS_PENDING,
         "",
         "",
+        "",
     ])
 
 
@@ -181,18 +182,23 @@ def get_receipts():
             "status": str(rec.get("Статус", "")),
             "coupon": str(rec.get("Купон", "")),
             "comment": str(rec.get("Комментарий", "")),
+            "deleted": str(rec.get("Удалён", "")).strip().lower() in ("да", "yes", "true", "1"),
         })
     return result
 
 
-def get_receipts_by_date(date_str: str):
-    """date_str в формате YYYY-MM-DD. Возвращает чеки за эту дату, любой статус."""
-    return [r for r in get_receipts() if r["date"].startswith(date_str)]
+def get_receipts_by_date(date_str: str, include_deleted: bool = False):
+    """date_str в формате YYYY-MM-DD. Возвращает чеки за эту дату, любой
+    статус. Помеченные удалёнными по умолчанию скрыты."""
+    return [
+        r for r in get_receipts()
+        if r["date"].startswith(date_str) and (include_deleted or not r["deleted"])
+    ]
 
 
 def get_pending_receipts():
-    """Возвращает чеки со статусом 'на модерации'."""
-    return [r for r in get_receipts() if r["status"] == STATUS_PENDING]
+    """Возвращает чеки со статусом 'на модерации' (без помеченных удалёнными)."""
+    return [r for r in get_receipts() if r["status"] == STATUS_PENDING and not r["deleted"]]
 
 
 def get_receipt_by_row(row_number: int):
@@ -202,10 +208,13 @@ def get_receipt_by_row(row_number: int):
     return None
 
 
-def delete_receipt(row_number: int):
-    """Полностью удаляет строку чека из листа 'Чеки' (действие необратимо)."""
+def mark_receipt_deleted(row_number: int, deleted: bool = True):
+    """Помечает чек как удалённый (или снимает пометку) — сама строка и
+    все данные в ней остаются в таблице, ничего не стирается."""
     ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_RECEIPTS, header=RECEIPTS_HEADER)
-    ws.delete_rows(row_number)
+    deleted_col = RECEIPTS_HEADER.index("Удалён") + 1
+    ws.update_cell(row_number, deleted_col, "да" if deleted else "")
+
 
 
 def update_receipt_status(row_number: int, status: str, coupon: str = None, comment: str = None):
