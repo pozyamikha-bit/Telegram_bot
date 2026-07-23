@@ -67,6 +67,12 @@ TEXT_LABELS = {
     "accept_message": "Сообщение при принятии чека (внутри можно оставить {coupon} — вместо него подставится номер купона)",
 }
 
+# Московское время: фиксированное смещение UTC+3 (в России нет перехода
+# на летнее/зимнее время с 2014 года), поэтому это всегда корректно и не
+# зависит от того, в каком часовом поясе запущен сам сервер (хостинг вроде
+# Amvera обычно работает в UTC) и не требует установки доп. библиотек.
+MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
+
 _client = None
 _spreadsheet = None
 _worksheet_cache = {}  # sheet_name -> gspread.Worksheet
@@ -143,13 +149,29 @@ def _invalidate_records_cache(sheet_name: str):
     _records_cache.pop(sheet_name, None)
 
 
+def moscow_now() -> datetime.datetime:
+    """Текущие дата и время по Москве."""
+    return datetime.datetime.now(MOSCOW_TZ)
+
+
+def moscow_today() -> datetime.date:
+    """Текущая дата по Москве (используется, например, для календаря
+    "История" и имени файла отчёта, чтобы не зависеть от часового пояса
+    сервера)."""
+    return moscow_now().date()
+
+
+def _moscow_now_str() -> str:
+    return moscow_now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 # ---------- Запись данных (используется в основном сценарии бота) ----------
 
 def append_registration(full_name: str, shop: str, phone: str, telegram_id: int, username: str):
     """Добавляет строку с данными регистрации в лист 'Регистрация'."""
     ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_REG, header=REGISTRATION_HEADER)
     ws.append_row([
-        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        _moscow_now_str(),
         full_name,
         shop,
         phone,
@@ -163,7 +185,7 @@ def append_receipt(telegram_id: int, username: str, file_id: str, file_name: str
     """Добавляет строку с данными о присланном чеке в лист 'Чеки'."""
     ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_RECEIPTS, header=RECEIPTS_HEADER)
     ws.append_row([
-        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        _moscow_now_str(),
         str(telegram_id),
         username or "",
         file_id,
@@ -310,7 +332,7 @@ def add_moderator(telegram_id: int, username: str, added_by: int):
         str(telegram_id),
         username or "",
         str(added_by),
-        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        _moscow_now_str(),
     ])
     _invalidate_records_cache(config.GOOGLE_SHEET_WORKSHEET_MODERATORS)
 

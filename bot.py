@@ -25,7 +25,6 @@ import calendar
 import io
 import logging
 import os
-from datetime import date
 
 import openpyxl
 from openpyxl.utils import get_column_letter
@@ -396,7 +395,7 @@ def _build_calendar(year: int, month: int):
 
 @dp.message(F.text == ADMIN_BTN_HISTORY, IsModerator())
 async def admin_history_start(message: Message):
-    today = date.today()
+    today = google_sheets.moscow_today()
     await message.answer("Выберите дату:", reply_markup=_build_calendar(today.year, today.month))
 
 
@@ -802,7 +801,7 @@ def _build_report_workbook() -> io.BytesIO:
     ws_receipts = wb.active
     ws_receipts.title = "Чеки"
     receipt_headers = [
-        "Дата", "Telegram ID", "Username", "ФИО", "Магазин", "Телефон",
+        "Дата чека", "Дата регистрации", "Telegram ID", "Username", "ФИО", "Магазин", "Телефон",
         "Статус", "Купон", "Комментарий", "Удалён",
     ]
     ws_receipts.append(receipt_headers)
@@ -810,6 +809,7 @@ def _build_report_workbook() -> io.BytesIO:
         reg = reg_by_id.get(r["telegram_id"])
         ws_receipts.append([
             r["date"],
+            reg["date"] if reg else "",
             r["telegram_id"],
             r["username"],
             reg["full_name"] if reg else "",
@@ -845,7 +845,7 @@ async def admin_report(message: Message):
         await message.answer("Не получилось сформировать отчёт, попробуйте позже.")
         return
 
-    filename = f"report_{date.today().strftime('%Y%m%d')}.xlsx"
+    filename = f"report_{google_sheets.moscow_today().strftime('%Y%m%d')}.xlsx"
     await message.answer_document(BufferedInputFile(buf.read(), filename=filename))
 
 
