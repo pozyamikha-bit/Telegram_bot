@@ -321,19 +321,25 @@ async def _send_receipt_card(message: Message, receipt: dict, with_moderation_bu
     await message.answer(caption, reply_markup=reply_markup)
 
 
+def _truncate(text: str, max_len: int) -> str:
+    text = text or ""
+    if len(text) > max_len:
+        return text[: max_len - 1] + "…"
+    return text
+
+
 def _format_receipt_label(r: dict) -> str:
     """Короткая подпись для кнопки в списке чеков: имя (или ID), магазин,
-    username — обрезается, чтобы уложиться в лимит длины текста кнопки."""
+    username. Каждая часть обрезается ОТДЕЛЬНО (а не всё целиком), иначе
+    при длинном ФИО магазин/username могли полностью "вытесняться" за
+    пределы общего лимита длины текста кнопки."""
     reg = google_sheets.get_registration_by_telegram_id(r["telegram_id"])
-    name = reg["full_name"] if reg else f"ID {r['telegram_id']}"
-    shop = reg.get("shop") if reg else ""
-    username = f"@{r['username']}" if r.get("username") else ""
+    name = _truncate(reg["full_name"] if reg else f"ID {r['telegram_id']}", 12)
+    shop = _truncate(reg.get("shop") if reg else "", 10)
+    username = _truncate(f"@{r['username']}" if r.get("username") else "", 10)
 
     parts = [p for p in [name, shop, username] if p]
-    label = " · ".join(parts)
-    if len(label) > 34:
-        label = label[:33] + "…"
-    return label
+    return " · ".join(parts)
 
 
 # ---------- История: календарь ----------
