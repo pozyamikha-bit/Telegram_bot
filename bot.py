@@ -26,6 +26,7 @@ import io
 import logging
 import os
 import re
+import datetime
 from datetime import date
 
 import openpyxl
@@ -76,8 +77,8 @@ class AdminForm(StatesGroup):
     waiting_reject_reason = State()
     waiting_promo_file = State()
     waiting_sales_file = State()
-    waiting_sales_period = State()
-    waiting_auto_moderation_period = State()
+    picking_period = State()
+    auto_mod_confirm = State()
 
 
 # ---------- Проверка прав доступа ----------
@@ -308,7 +309,11 @@ async def wrong_content_for_photo(message: Message):
 async def process_upd_number(message: Message, state: FSMContext):
     await state.update_data(upd_number=message.text.strip())
     await state.set_state(Form.waiting_receipt_date)
-    await message.answer(google_sheets.get_text("ask_receipt_date"))
+    today = google_sheets.moscow_today()
+    await message.answer(
+        google_sheets.get_text("ask_receipt_date"),
+        reply_markup=_build_calendar(today.year, today.month, prefix="rcal"),
+    )
 
 
 @dp.message(StateFilter(Form.waiting_upd_number))
@@ -316,26 +321,30 @@ async def wrong_content_for_upd_number(message: Message):
     await message.answer("Пожалуйста, введите номер УПД текстом (одним сообщением).")
 
 
-_DATE_LIKE_RE = re.compile(r"^\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}$")
+@dp.callback_query(F.data == "rcal_ignore")
+async def receipt_calendar_ignore(call: CallbackQuery):
+    await call.answer()
 
 
-@dp.message(StateFilter(Form.waiting_receipt_date), F.text)
-async def process_receipt_date(message: Message, state: FSMContext):
-    receipt_date = message.text.strip()
+@dp.callback_query(F.data.startswith("rcal_nav:"), StateFilter(Form.waiting_receipt_date))
+async def receipt_calendar_nav(call: CallbackQuery):
+    _, ym = call.data.split(":", 1)
+    year, month = map(int, ym.split("-"))
+    await call.message.edit_reply_markup(reply_markup=_build_calendar(year, month, prefix="rcal"))
+    await call.answer()
 
-    if not _DATE_LIKE_RE.match(receipt_date):
-        await message.answer(
-            "Похоже, это не дата. Введите дату чека в формате ДД.ММ.ГГГГ, "
-            "например 21.07.2026."
-        )
-        return
+
+@dp.callback_query(F.data.startswith("rcal_day:"), StateFilter(Form.waiting_receipt_date))
+async def receipt_calendar_pick_day(call: CallbackQuery, state: FSMContext):
+    _, date_str = call.data.split(":", 1)
+    year_s, month_s, day_s = date_str.split("-")
+    receipt_date = f"{day_s}.{month_s}.{year_s}"
 
     data = await state.get_data()
-
     try:
         google_sheets.append_receipt(
-            telegram_id=message.from_user.id,
-            username=message.from_user.username,
+            telegram_id=call.from_user.id,
+            username=call.from_user.username,
             file_id=data.get("photo_file_id", ""),
             file_name=data.get("photo_file_name", ""),
             upd_number=data.get("upd_number", ""),
@@ -345,15 +354,25 @@ async def process_receipt_date(message: Message, state: FSMContext):
         logger.exception("Не удалось записать чек в Google Таблицу")
 
     await state.clear()
-    await message.answer(
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer(
         google_sheets.get_text("receipt_received"),
         reply_markup=main_menu,
+    )
+    await call.answer(f"Дата чека: {receipt_date}")
+
+
+@dp.callback_query(F.data.startswith("rcal_day:"))
+async def receipt_calendar_pick_day_stale(call: CallbackQuery):
+    await call.answer(
+        "Эта кнопка уже не активна. Начните заново через «📥 Отправить чек / УПД».",
+        show_alert=True,
     )
 
 
 @dp.message(StateFilter(Form.waiting_receipt_date))
 async def wrong_content_for_receipt_date(message: Message):
-    await message.answer("Пожалуйста, введите дату чека текстом, в формате ДД.ММ.ГГГГ.")
+    await message.answer("Пожалуйста, выберите дату чека кнопками календаря в сообщении выше.")
 
 
 # ---------- Загруженные чеки (для самого пользователя) ----------
@@ -494,12 +513,16 @@ MONTHS_RU = [
 ]
 
 
-def _build_calendar(year: int, month: int):
+def _build_calendar(year: int, month: int, prefix: str = "cal"):
+    """Строит инлайн-календарь на месяц. prefix различает, для какой
+    именно цели используется календарь (история модератора, дата чека
+    пользователя, начало/конец периода для отчёта) — у каждого свои
+    callback_data и свои обработчики, чтобы они не пересекались."""
     builder = InlineKeyboardBuilder()
 
-    builder.row(InlineKeyboardButton(text=f"{MONTHS_RU[month]} {year}", callback_data="cal_ignore"))
+    builder.row(InlineKeyboardButton(text=f"{MONTHS_RU[month]} {year}", callback_data=f"{prefix}_ignore"))
     builder.row(*[
-        InlineKeyboardButton(text=d, callback_data="cal_ignore")
+        InlineKeyboardButton(text=d, callback_data=f"{prefix}_ignore")
         for d in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     ])
 
@@ -507,19 +530,19 @@ def _build_calendar(year: int, month: int):
         row = []
         for day in week:
             if day == 0:
-                row.append(InlineKeyboardButton(text=" ", callback_data="cal_ignore"))
+                row.append(InlineKeyboardButton(text=" ", callback_data=f"{prefix}_ignore"))
             else:
                 row.append(InlineKeyboardButton(
                     text=str(day),
-                    callback_data=f"cal_day:{year:04d}-{month:02d}-{day:02d}",
+                    callback_data=f"{prefix}_day:{year:04d}-{month:02d}-{day:02d}",
                 ))
         builder.row(*row)
 
     prev_year, prev_month = (year - 1, 12) if month == 1 else (year, month - 1)
     next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
     builder.row(
-        InlineKeyboardButton(text="◀️", callback_data=f"cal_nav:{prev_year:04d}-{prev_month:02d}"),
-        InlineKeyboardButton(text="▶️", callback_data=f"cal_nav:{next_year:04d}-{next_month:02d}"),
+        InlineKeyboardButton(text="◀️", callback_data=f"{prefix}_nav:{prev_year:04d}-{prev_month:02d}"),
+        InlineKeyboardButton(text="▶️", callback_data=f"{prefix}_nav:{next_year:04d}-{next_month:02d}"),
     )
     return builder.as_markup()
 
@@ -527,7 +550,7 @@ def _build_calendar(year: int, month: int):
 @dp.message(F.text == ADMIN_BTN_HISTORY, IsModerator())
 async def admin_history_start(message: Message):
     today = google_sheets.moscow_today()
-    await message.answer("Выберите дату:", reply_markup=_build_calendar(today.year, today.month))
+    await message.answer("Выберите дату:", reply_markup=_build_calendar(today.year, today.month, prefix="cal"))
 
 
 @dp.callback_query(F.data == "cal_ignore", IsModerator())
@@ -539,7 +562,7 @@ async def admin_calendar_ignore(call: CallbackQuery):
 async def admin_calendar_nav(call: CallbackQuery):
     _, ym = call.data.split(":", 1)
     year, month = map(int, ym.split("-"))
-    await call.message.edit_reply_markup(reply_markup=_build_calendar(year, month))
+    await call.message.edit_reply_markup(reply_markup=_build_calendar(year, month, prefix="cal"))
     await call.answer()
 
 
@@ -971,6 +994,24 @@ async def admin_import_sales_start(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+def _xlsx_cell_to_str(cell) -> str:
+    """Аккуратно превращает значение ячейки Excel в текст:
+    - даты (date/datetime) -> ДД.ММ.ГГГГ, а не "2026-07-15 00:00:00";
+    - "круглые" числа (10.0) -> "10", а не "10.0" (важно для ИНН/УПД/артикулов);
+    - остальное -> обычный str().strip()."""
+    if cell is None:
+        return ""
+    if isinstance(cell, datetime.datetime):
+        return cell.strftime("%d.%m.%Y")
+    if isinstance(cell, date):
+        return cell.strftime("%d.%m.%Y")
+    if isinstance(cell, float):
+        if cell.is_integer():
+            return str(int(cell))
+        return str(cell).strip()
+    return str(cell).strip()
+
+
 def _read_xlsx_rows(file_bytes: io.BytesIO, min_columns: int):
     """Читает .xlsx: первая строка — заголовок (пропускается), из
     остальных строк берёт первые min_columns колонок текстом. Полностью
@@ -981,7 +1022,7 @@ def _read_xlsx_rows(file_bytes: io.BytesIO, min_columns: int):
     for row in ws.iter_rows(min_row=2, values_only=True):
         if row is None or all(cell in (None, "") for cell in row):
             continue
-        values = ["" if cell is None else str(cell).strip() for cell in row[:min_columns]]
+        values = [_xlsx_cell_to_str(cell) for cell in row[:min_columns]]
         if len(values) < min_columns:
             values += [""] * (min_columns - len(values))
         rows.append(values)
@@ -1146,19 +1187,20 @@ def _parse_date_loose(text: str):
         return None
 
 
-_PERIOD_RE = re.compile(r"^(.+?)\s*-\s*(.+)$")
-
-
 @dp.callback_query(F.data == "report_sales_match", IsModerator())
 async def admin_report_sales_match_start(call: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminForm.waiting_sales_period)
+    await state.set_state(AdminForm.picking_period)
+    await state.update_data(period_purpose="sales_match")
+    today = google_sheets.moscow_today()
     await call.message.answer(
-        "Пришлите период для сверки в формате ДД.ММ.ГГГГ - ДД.ММ.ГГГГ, "
-        "например 01.07.2026 - 22.07.2026.\n\n"
-        "Бот сверит чеки с датой чека в этом периоде (у которых указаны "
-        "ИНН, номер УПД и дата) с загруженным отчётом по продажам: "
-        "совпадением считается одинаковые ИНН + № УПД + дата продажи, "
-        "и хотя бы один товар по этому УПД — из списка акционных позиций."
+        "Сверка чеков с отчётом по продажам.\n\n"
+        "Выберите дату НАЧАЛА периода в календаре ниже (сверка идёт по "
+        "дате чека). Бот сверит чеки с датой чека в этом периоде (у "
+        "которых указаны ИНН, номер УПД и дата) с загруженным отчётом по "
+        "продажам: совпадением считается одинаковые ИНН + № УПД + дата "
+        "продажи, и хотя бы один товар по этому УПД — из списка акционных "
+        "позиций.",
+        reply_markup=_build_calendar(today.year, today.month, prefix="pstart"),
     )
     await call.answer()
 
@@ -1248,116 +1290,176 @@ def _build_sales_match_workbook(start_date: date, end_date: date):
     return buf, len(matched), len(unmatched), matched_rows
 
 
-@dp.message(StateFilter(AdminForm.waiting_sales_period), F.text)
-async def admin_report_sales_match_finish(message: Message, state: FSMContext):
-    m = _PERIOD_RE.match(message.text.strip())
-    start_date = end_date = None
-    if m:
-        start_date = _parse_date_loose(m.group(1))
-        end_date = _parse_date_loose(m.group(2))
+# ---------- Автоматическая модерация (та же сверка + смена статуса) ----------
 
-    if not m or not start_date or not end_date or start_date > end_date:
-        await message.answer(
-            "Не получилось разобрать период. Введите в формате "
-            "ДД.ММ.ГГГГ - ДД.ММ.ГГГГ, например 01.07.2026 - 22.07.2026."
-        )
+@dp.callback_query(F.data == "moderation_auto", IsModerator())
+async def admin_moderation_auto_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminForm.picking_period)
+    await state.update_data(period_purpose="auto_mod")
+    today = google_sheets.moscow_today()
+    await call.message.answer(
+        "Автоматическая модерация.\n\n"
+        "Выберите дату НАЧАЛА периода в календаре ниже (по дате чека). "
+        "Бот сверит чеки за этот период с отчётом по продажам (так же, "
+        "как «📊 Отчёты» -> «🔎 Отчёт по продажам»), пришлёт Excel и "
+        "предложит сразу проставить статус «принят» найденным "
+        "совпадениям.",
+        reply_markup=_build_calendar(today.year, today.month, prefix="pstart"),
+    )
+    await call.answer()
+
+
+# ---------- Общий календарь выбора периода (начало/конец) для обеих задач выше ----------
+
+@dp.callback_query(F.data == "pstart_ignore")
+async def period_start_calendar_ignore(call: CallbackQuery):
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("pstart_nav:"), StateFilter(AdminForm.picking_period))
+async def period_start_calendar_nav(call: CallbackQuery):
+    _, ym = call.data.split(":", 1)
+    year, month = map(int, ym.split("-"))
+    await call.message.edit_reply_markup(reply_markup=_build_calendar(year, month, prefix="pstart"))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("pstart_day:"), StateFilter(AdminForm.picking_period))
+async def period_start_calendar_pick_day(call: CallbackQuery, state: FSMContext):
+    _, date_str = call.data.split(":", 1)
+    await state.update_data(period_start=date_str)
+    year_s, month_s, day_s = date_str.split("-")
+
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer(
+        f"Начало периода: {day_s}.{month_s}.{year_s}.\n"
+        "Теперь выберите дату ОКОНЧАНИЯ периода:",
+        reply_markup=_build_calendar(int(year_s), int(month_s), prefix="pend"),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("pstart_day:"))
+async def period_start_calendar_pick_day_stale(call: CallbackQuery):
+    await call.answer("Эта кнопка уже не активна. Начните заново через меню «📊 Отчёты» / «🛠 Модерация».", show_alert=True)
+
+
+@dp.callback_query(F.data == "pend_ignore")
+async def period_end_calendar_ignore(call: CallbackQuery):
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("pend_nav:"), StateFilter(AdminForm.picking_period))
+async def period_end_calendar_nav(call: CallbackQuery):
+    _, ym = call.data.split(":", 1)
+    year, month = map(int, ym.split("-"))
+    await call.message.edit_reply_markup(reply_markup=_build_calendar(year, month, prefix="pend"))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("pend_day:"), StateFilter(AdminForm.picking_period))
+async def period_end_calendar_pick_day(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    start_str = data.get("period_start")
+    purpose = data.get("period_purpose")
+    if not start_str or not purpose:
+        await call.answer("Сначала выберите дату начала периода. Начните заново.", show_alert=True)
+        await state.clear()
         return
 
-    await message.answer("Сверяю данные, секунду...")
+    _, end_str = call.data.split(":", 1)
+    start_year_s, start_month_s, start_day_s = start_str.split("-")
+    end_year_s, end_month_s, end_day_s = end_str.split("-")
+    start_date = date(int(start_year_s), int(start_month_s), int(start_day_s))
+    end_date = date(int(end_year_s), int(end_month_s), int(end_day_s))
 
+    if end_date < start_date:
+        await call.answer("Дата окончания раньше даты начала — выберите другую дату.", show_alert=True)
+        return
+
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.answer()
+    await call.message.answer(
+        f"Период: {start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}. "
+        "Сверяю данные, секунду..."
+    )
+    await _run_period_matching(call.message, state, purpose, start_date, end_date, call.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("pend_day:"))
+async def period_end_calendar_pick_day_stale(call: CallbackQuery):
+    await call.answer("Эта кнопка уже не активна. Начните заново через меню «📊 Отчёты» / «🛠 Модерация».", show_alert=True)
+
+
+@dp.message(StateFilter(AdminForm.picking_period))
+async def wrong_content_for_period_picking(message: Message):
+    await message.answer("Пожалуйста, выберите дату кнопками календаря в сообщении выше.")
+
+
+async def _run_period_matching(
+    message: Message,
+    state: FSMContext,
+    purpose: str,
+    start_date: date,
+    end_date: date,
+    user_id: int,
+):
+    """Общая логика сверки для «📊 Отчёты -> Отчёт по продажам» и
+    «🛠 Модерация -> Автоматическая модерация»: строит Excel сверки и
+    либо просто присылает его (purpose == "sales_match"), либо
+    дополнительно предлагает сразу сменить статусы (purpose == "auto_mod")."""
     try:
-        buf, matched_count, unmatched_count, _matched_rows = _build_sales_match_workbook(start_date, end_date)
+        buf, matched_count, unmatched_count, matched_rows = _build_sales_match_workbook(start_date, end_date)
     except Exception:
         logger.exception("Не удалось выполнить сверку продаж")
         await message.answer("Не получилось выполнить сверку, попробуйте позже.")
         await state.clear()
         return
 
-    await state.clear()
-    filename = f"sverka_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
-    await message.answer_document(
-        BufferedInputFile(buf.read(), filename=filename),
-        caption=f"Совпадений: {matched_count}. Без совпадений: {unmatched_count}.",
-        reply_markup=_menu_for(message.from_user.id),
-    )
+    filename_suffix = f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
 
+    if purpose == "auto_mod":
+        filename = f"avto_moderatsiya_{filename_suffix}.xlsx"
+        await message.answer_document(
+            BufferedInputFile(buf.read(), filename=filename),
+            caption=(
+                f"Совпадений: {matched_count}. Без совпадений: {unmatched_count}. "
+                f"Уникальных чеков с совпадением: {len(matched_rows)}."
+            ),
+        )
 
-@dp.message(StateFilter(AdminForm.waiting_sales_period))
-async def wrong_content_for_sales_period(message: Message):
-    await message.answer("Пожалуйста, пришлите период текстом, в формате ДД.ММ.ГГГГ - ДД.ММ.ГГГГ.")
+        if not matched_rows:
+            await state.clear()
+            await message.answer("Менять нечего — совпадений не найдено.", reply_markup=_menu_for(user_id))
+            return
 
-
-# ---------- Автоматическая модерация (та же сверка + смена статуса) ----------
-
-@dp.callback_query(F.data == "moderation_auto", IsModerator())
-async def admin_moderation_auto_start(call: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminForm.waiting_auto_moderation_period)
-    await call.message.answer(
-        "Пришлите период для автоматической модерации в формате "
-        "ДД.ММ.ГГГГ - ДД.ММ.ГГГГ, например 01.07.2026 - 22.07.2026.\n\n"
-        "Бот сверит чеки за этот период с отчётом по продажам (так же, "
-        "как «📊 Отчёты» -> «🔎 Отчёт по продажам»), пришлёт Excel и "
-        "предложит сразу проставить статус «принят» найденным "
-        "совпадениям."
-    )
-    await call.answer()
-
-
-@dp.message(StateFilter(AdminForm.waiting_auto_moderation_period), F.text)
-async def admin_moderation_auto_finish(message: Message, state: FSMContext):
-    m = _PERIOD_RE.match(message.text.strip())
-    start_date = end_date = None
-    if m:
-        start_date = _parse_date_loose(m.group(1))
-        end_date = _parse_date_loose(m.group(2))
-
-    if not m or not start_date or not end_date or start_date > end_date:
+        await state.set_state(AdminForm.auto_mod_confirm)
+        await state.update_data(matched_rows=matched_rows)
+        kb = InlineKeyboardBuilder()
+        kb.row(
+            InlineKeyboardButton(text="✅ Да", callback_data="auto_mod_apply_yes"),
+            InlineKeyboardButton(text="❌ Нет", callback_data="auto_mod_apply_no"),
+        )
         await message.answer(
-            "Не получилось разобрать период. Введите в формате "
-            "ДД.ММ.ГГГГ - ДД.ММ.ГГГГ, например 01.07.2026 - 22.07.2026."
+            f"Изменить статус чеков на «принят» у {len(matched_rows)} шт. "
+            "(совпавших по ИНН/№ УПД/дате продажи с акционным товаром)? "
+            "Пользователям сообщение отправлено НЕ будет — купон в этом "
+            "сценарии не назначается, меняется только статус в таблице.",
+            reply_markup=kb.as_markup(),
         )
         return
 
-    await message.answer("Сверяю данные, секунду...")
-
-    try:
-        buf, matched_count, unmatched_count, matched_rows = _build_sales_match_workbook(start_date, end_date)
-    except Exception:
-        logger.exception("Не удалось выполнить автоматическую модерацию")
-        await message.answer("Не получилось выполнить сверку, попробуйте позже.")
-        await state.clear()
-        return
-
-    filename = f"avto_moderatsiya_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+    # purpose == "sales_match"
+    await state.clear()
+    filename = f"sverka_{filename_suffix}.xlsx"
     await message.answer_document(
         BufferedInputFile(buf.read(), filename=filename),
-        caption=(
-            f"Совпадений: {matched_count}. Без совпадений: {unmatched_count}. "
-            f"Уникальных чеков с совпадением: {len(matched_rows)}."
-        ),
-    )
-
-    if not matched_rows:
-        await state.clear()
-        await message.answer("Менять нечего — совпадений не найдено.", reply_markup=_menu_for(message.from_user.id))
-        return
-
-    await state.update_data(matched_rows=matched_rows)
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text="✅ Да", callback_data="auto_mod_apply_yes"),
-        InlineKeyboardButton(text="❌ Нет", callback_data="auto_mod_apply_no"),
-    )
-    await message.answer(
-        f"Изменить статус чеков на «принят» у {len(matched_rows)} шт. "
-        "(совпавших по ИНН/№ УПД/дате продажи с акционным товаром)? "
-        "Пользователям сообщение отправлено НЕ будет — купон в этом "
-        "сценарии не назначается, меняется только статус в таблице.",
-        reply_markup=kb.as_markup(),
+        caption=f"Совпадений: {matched_count}. Без совпадений: {unmatched_count}.",
+        reply_markup=_menu_for(user_id),
     )
 
 
-@dp.callback_query(F.data == "auto_mod_apply_yes", IsModerator())
+@dp.callback_query(F.data == "auto_mod_apply_yes", IsModerator(), StateFilter(AdminForm.auto_mod_confirm))
 async def admin_moderation_auto_apply_yes(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     rows = data.get("matched_rows", [])
@@ -1379,16 +1481,16 @@ async def admin_moderation_auto_apply_yes(call: CallbackQuery, state: FSMContext
     await call.message.answer(f"Готово, статус изменён у {updated} из {len(rows)} чеков.")
 
 
-@dp.callback_query(F.data == "auto_mod_apply_no", IsModerator())
+@dp.callback_query(F.data == "auto_mod_apply_no", IsModerator(), StateFilter(AdminForm.auto_mod_confirm))
 async def admin_moderation_auto_apply_no(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await call.answer()
     await call.message.answer("Хорошо, статусы не менял.")
 
 
-@dp.message(StateFilter(AdminForm.waiting_auto_moderation_period))
-async def wrong_content_for_auto_moderation_period(message: Message):
-    await message.answer("Пожалуйста, пришлите период текстом, в формате ДД.ММ.ГГГГ - ДД.ММ.ГГГГ.")
+@dp.callback_query(F.data.in_({"auto_mod_apply_yes", "auto_mod_apply_no"}))
+async def admin_moderation_auto_apply_stale(call: CallbackQuery):
+    await call.answer("Эта кнопка уже не активна.", show_alert=True)
 
 
 async def main():
