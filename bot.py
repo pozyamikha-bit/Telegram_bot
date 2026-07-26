@@ -1227,6 +1227,13 @@ def _build_report_workbook() -> io.BytesIO:
         ws_reg.append([reg["date"], reg["full_name"], reg["shop"], reg["inn"], reg["phone"], reg["telegram_id"], reg["username"]])
     _autosize(ws_reg, reg_headers)
 
+    ws_promo = wb.create_sheet("Акционные товары")
+    promo_headers = ["Артикул", "Наименование"]
+    ws_promo.append(promo_headers)
+    for item in google_sheets.get_promo_items():
+        ws_promo.append([item["article"], item["name"]])
+    _autosize(ws_promo, promo_headers)
+
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
