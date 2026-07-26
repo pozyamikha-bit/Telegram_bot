@@ -1169,12 +1169,30 @@ async def admin_report_general(call: CallbackQuery):
 
 # ---------- Отчёт по продажам (сверка чеков с отчётом по продажам) ----------
 
+_ISO_DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d")
+
+
 def _parse_date_loose(text: str):
-    """Разбирает дату в разных написаниях (точки/дефисы/слэши, 2 или 4
-    цифры года) в объект date. Возвращает None, если не получилось."""
+    """Разбирает дату в разных написаниях в объект date. Возвращает None,
+    если не получилось. Понимает:
+    - ДД.ММ.ГГГГ (а также с "/" или "-" вместо точек, и 2-значный год);
+    - "ГГГГ-ММ-ДД" и "ГГГГ-ММ-ДД ЧЧ:ММ:СС" — так выглядит дата, если её
+      когда-то записали в Google Таблицу как str(datetime) (например, из
+      старых импортов отчёта по продажам, сделанных до того, как чтение
+      .xlsx-дат было исправлено) — чтобы уже загруженные ранее строки с
+      таким "испорченным" форматом тоже подхватывались сверкой, а не
+      требовали повторной загрузки файла."""
     if not text:
         return None
-    normalized = re.sub(r"[/\-]", ".", text.strip())
+    text = text.strip()
+
+    for fmt in _ISO_DATE_FORMATS:
+        try:
+            return datetime.datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+
+    normalized = re.sub(r"[/\-]", ".", text)
     parts = normalized.split(".")
     if len(parts) != 3:
         return None
