@@ -26,8 +26,14 @@ SCOPES = [
 # уже существовал ДО перехода на эту версию кода (без заголовка) —
 # добавьте эту строку первой строкой в лист вручную в Google Sheets,
 # иначе первая строка с данными будет ошибочно принята за заголовок.
-REGISTRATION_HEADER = ["Дата регистрации", "ФИО", "Магазин", "Телефон", "Telegram ID", "Username"]
-RECEIPTS_HEADER = ["Дата", "Telegram ID", "Username", "File ID", "Файл", "Статус", "Купон", "Комментарий", "Удалён"]
+REGISTRATION_HEADER = [
+    "Дата регистрации", "ФИО", "Магазин", "Телефон", "Telegram ID", "Username",
+    "ИНН магазина",
+]
+RECEIPTS_HEADER = [
+    "Дата", "Telegram ID", "Username", "File ID", "Файл", "Статус", "Купон",
+    "Комментарий", "Удалён", "№ УПД", "Дата чека",
+]
 MODERATORS_HEADER = ["Telegram ID", "Username", "Добавил (ID)", "Дата добавления"]
 
 STATUS_PENDING = "на модерации"
@@ -35,6 +41,14 @@ STATUS_ACCEPTED = "принят"
 STATUS_REJECTED = "отклонён"
 
 TEXTS_HEADER = ["Ключ", "Текст"]
+
+# Импортируемые владельцем списки (админ-панель -> "📥 Импорт"). Каждая
+# новая загрузка полностью заменяет предыдущее содержимое листа.
+PROMO_ITEMS_HEADER = ["Артикул", "Наименование"]
+SALES_REPORT_HEADER = [
+    "ИНН", "Наименование", "Артикул", "Количество", "Цена", "№ УПД", "Дата продажи",
+    "Дата загрузки",
+]
 
 # Тексты-автоответы по умолчанию. Их можно менять прямо из бота
 # (админ-панель -> "✏️ Тексты"), тогда значение сохраняется в лист
@@ -49,9 +63,12 @@ DEFAULT_TEXTS = {
     ),
     "ask_photo": (
         "Пришлите ОДНО фото чека или УПД. "
-        "На фото должно быть видно дату и название товара."
+        "На фото должно быть видно дату и название товара.\n\n"
+        "После фото я попрошу вручную ввести номер УПД и дату чека."
     ),
     "registration_success": "Регистрация успешна! Теперь ты можешь отправлять чеки.",
+    "ask_upd_number": "Введите номер УПД, указанный на чеке.",
+    "ask_receipt_date": "Введите дату чека в формате ДД.ММ.ГГГГ (например, 21.07.2026).",
     "receipt_received": "Спасибо! Чек принят на модерацию. Ожидайте купон Ozon.",
     "reject_message": "Плохое качество фото чека, просьба повторно зарегистрировать чек",
     "accept_message": "Ваш чек принят! Ваш купон Ozon: {coupon}",
@@ -62,6 +79,8 @@ TEXT_LABELS = {
     "rules": "Текст кнопки «Правила»",
     "ask_photo": "Просьба прислать фото чека",
     "registration_success": "Сообщение после успешной регистрации",
+    "ask_upd_number": "Просьба ввести номер УПД (после фото чека)",
+    "ask_receipt_date": "Просьба ввести дату чека (после номера УПД)",
     "receipt_received": "Ответ сразу после получения чека",
     "reject_message": "Сообщение при отклонении кнопкой «Быстрое отклонение»",
     "accept_message": "Сообщение при принятии чека (внутри можно оставить {coupon} — вместо него подставится номер купона)",
@@ -112,6 +131,37 @@ def _get_spreadsheet():
     return _spreadsheet
 
 
+def _ensure_header(ws, expected_header):
+    """Если в листе уже есть заголовок, но в нём не хватает только новых
+    столбцов, добавленных в конце (например, при обновлении кода бота) —
+    дописывает их в первую строку автоматически, чтобы не приходилось
+    лезть в Google Таблицу руками. Если заголовок отличается как-то иначе
+    (другой порядок, опечатки, лишние пустые ячейки в середине) — ничего
+    не трогает, чтобы не испортить существующие данные; в этом случае
+    нужно поправить вручную (см. check_headers.py)."""
+    try:
+        actual = ws.row_values(1)
+    except Exception:
+        logger.exception("Не удалось прочитать заголовок листа '%s'", ws.title)
+        return
+
+    if not actual or actual == expected_header:
+        return
+
+    n = len(actual)
+    if n < len(expected_header) and actual == list(expected_header[:n]):
+        missing = expected_header[n:]
+        try:
+            for i, col_name in enumerate(missing, start=n + 1):
+                ws.update_cell(1, i, col_name)
+            logger.info(
+                "В листе '%s' автоматически дописаны недостающие заголовки: %s",
+                ws.title, missing,
+            )
+        except Exception:
+            logger.exception("Не удалось дописать заголовки в лист '%s'", ws.title)
+
+
 def _get_worksheet(sheet_name: str, header=None):
     if sheet_name in _worksheet_cache:
         return _worksheet_cache[sheet_name]
@@ -119,6 +169,8 @@ def _get_worksheet(sheet_name: str, header=None):
     spreadsheet = _get_spreadsheet()
     try:
         ws = spreadsheet.worksheet(sheet_name)
+        if header:
+            _ensure_header(ws, header)
     except gspread.WorksheetNotFound:
         # Если листа с таким названием ещё нет в таблице - создаём его сам
         logger.info("Лист '%s' не найден, создаю новый", sheet_name)
@@ -167,7 +219,9 @@ def _moscow_now_str() -> str:
 
 # ---------- Запись данных (используется в основном сценарии бота) ----------
 
-def append_registration(full_name: str, shop: str, phone: str, telegram_id: int, username: str):
+def append_registration(
+    full_name: str, shop: str, phone: str, telegram_id: int, username: str, inn: str = "",
+):
     """Добавляет строку с данными регистрации в лист 'Регистрация'."""
     ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_REG, header=REGISTRATION_HEADER)
     ws.append_row([
@@ -177,12 +231,22 @@ def append_registration(full_name: str, shop: str, phone: str, telegram_id: int,
         phone,
         str(telegram_id),
         username or "",
+        inn or "",
     ])
     _invalidate_records_cache(config.GOOGLE_SHEET_WORKSHEET_REG)
 
 
-def append_receipt(telegram_id: int, username: str, file_id: str, file_name: str):
-    """Добавляет строку с данными о присланном чеке в лист 'Чеки'."""
+def append_receipt(
+    telegram_id: int,
+    username: str,
+    file_id: str,
+    file_name: str,
+    upd_number: str = "",
+    receipt_date: str = "",
+):
+    """Добавляет строку с данными о присланном чеке в лист 'Чеки'.
+    upd_number и receipt_date — номер УПД и дата чека, которые пользователь
+    вводит вручную (текстом) сразу после отправки фото."""
     ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_RECEIPTS, header=RECEIPTS_HEADER)
     ws.append_row([
         _moscow_now_str(),
@@ -194,6 +258,8 @@ def append_receipt(telegram_id: int, username: str, file_id: str, file_name: str
         "",
         "",
         "",
+        upd_number or "",
+        receipt_date or "",
     ])
     _invalidate_records_cache(config.GOOGLE_SHEET_WORKSHEET_RECEIPTS)
 
@@ -212,13 +278,14 @@ def get_all_registrations():
             "phone": str(rec.get("Телефон", "")),
             "telegram_id": str(rec.get("Telegram ID", "")),
             "username": str(rec.get("Username", "")),
+            "inn": str(rec.get("ИНН магазина", "")),
         })
     return result
 
 
 def get_registration_by_telegram_id(telegram_id):
     """Возвращает последнюю регистрацию пользователя с данным Telegram ID
-    в виде {"full_name", "shop", "phone"} или None, если не найдено."""
+    в виде {"full_name", "shop", "phone", "inn"} или None, если не найдено."""
     records = _get_records(config.GOOGLE_SHEET_WORKSHEET_REG, header=REGISTRATION_HEADER)
     telegram_id = str(telegram_id)
     for rec in reversed(records):
@@ -227,6 +294,7 @@ def get_registration_by_telegram_id(telegram_id):
                 "full_name": rec.get("ФИО", ""),
                 "shop": rec.get("Магазин", ""),
                 "phone": rec.get("Телефон", ""),
+                "inn": rec.get("ИНН магазина", ""),
             }
     return None
 
@@ -248,6 +316,8 @@ def get_receipts():
             "coupon": str(rec.get("Купон", "")),
             "comment": str(rec.get("Комментарий", "")),
             "deleted": str(rec.get("Удалён", "")).strip().lower() in ("да", "yes", "true", "1"),
+            "upd_number": str(rec.get("№ УПД", "")),
+            "receipt_date": str(rec.get("Дата чека", "")),
         })
     return result
 
@@ -264,6 +334,17 @@ def get_receipts_by_date(date_str: str, include_deleted: bool = False):
 def get_pending_receipts():
     """Возвращает чеки со статусом 'на модерации' (без помеченных удалёнными)."""
     return [r for r in get_receipts() if r["status"] == STATUS_PENDING and not r["deleted"]]
+
+
+def get_receipts_by_telegram_id(telegram_id, include_deleted: bool = True):
+    """Возвращает все чеки конкретного пользователя (для его личного отчёта
+    "Загруженные чеки") — по умолчанию включая помеченные удалёнными, чтобы
+    пользователь видел полную историю своих загрузок."""
+    telegram_id = str(telegram_id)
+    return [
+        r for r in get_receipts()
+        if r["telegram_id"] == telegram_id and (include_deleted or not r["deleted"])
+    ]
 
 
 def get_receipt_by_row(row_number: int):
@@ -375,3 +456,65 @@ def set_text(key: str, value: str):
         ws.append_row([key, value])
     finally:
         _invalidate_records_cache(config.GOOGLE_SHEET_WORKSHEET_TEXTS)
+
+
+# ---------- Импорт списков владельцем (акционные позиции / продажи) ----------
+
+def _replace_sheet_data(sheet_name: str, header: list, rows: list):
+    """Полностью заменяет содержимое листа: старые данные стираются,
+    записывается новый заголовок и переданные строки. Используется для
+    "Импорта" в админ-панели, где каждая новая загрузка файла заменяет
+    предыдущий список целиком."""
+    ws = _get_worksheet(sheet_name, header=header)
+    ws.clear()
+    ws.update("A1", [header] + [list(row) for row in rows])
+    _invalidate_records_cache(sheet_name)
+
+
+def import_promo_items(rows):
+    """rows: список [артикул, наименование]. Полностью заменяет лист
+    "Акционные позиции"."""
+    _replace_sheet_data(config.GOOGLE_SHEET_WORKSHEET_PROMO_ITEMS, PROMO_ITEMS_HEADER, rows)
+
+
+def get_promo_items():
+    records = _get_records(config.GOOGLE_SHEET_WORKSHEET_PROMO_ITEMS, header=PROMO_ITEMS_HEADER)
+    return [
+        {
+            "article": str(rec.get("Артикул", "")),
+            "name": str(rec.get("Наименование", "")),
+        }
+        for rec in records
+    ]
+
+
+def import_sales_report(rows):
+    """rows: список [ИНН, наименование, артикул, количество, цена,
+    № УПД, дата продажи]. В отличие от import_promo_items — НЕ заменяет
+    предыдущие загрузки, а добавляет новые строки к уже имеющимся
+    (история копится), проставляя каждой строке дату и время именно
+    этой загрузки (по Москве) — чтобы потом можно было понять, из
+    какого именно импорта пришла строка."""
+    ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_SALES_REPORT, header=SALES_REPORT_HEADER)
+    upload_ts = _moscow_now_str()
+    values = [list(row) + [upload_ts] for row in rows]
+    if values:
+        ws.append_rows(values)
+    _invalidate_records_cache(config.GOOGLE_SHEET_WORKSHEET_SALES_REPORT)
+
+
+def get_sales_report():
+    records = _get_records(config.GOOGLE_SHEET_WORKSHEET_SALES_REPORT, header=SALES_REPORT_HEADER)
+    return [
+        {
+            "inn": str(rec.get("ИНН", "")),
+            "name": str(rec.get("Наименование", "")),
+            "article": str(rec.get("Артикул", "")),
+            "quantity": str(rec.get("Количество", "")),
+            "price": str(rec.get("Цена", "")),
+            "upd_number": str(rec.get("№ УПД", "")),
+            "sale_date": str(rec.get("Дата продажи", "")),
+            "upload_date": str(rec.get("Дата загрузки", "")),
+        }
+        for rec in records
+    ]

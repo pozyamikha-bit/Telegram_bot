@@ -25,6 +25,8 @@ import calendar
 import io
 import logging
 import os
+import re
+from datetime import date
 
 import openpyxl
 from openpyxl.utils import get_column_letter
@@ -60,8 +62,11 @@ os.makedirs(config.RECEIPTS_DIR, exist_ok=True)
 class Form(StatesGroup):
     name = State()
     shop = State()
+    inn = State()
     phone = State()
     waiting_photo = State()
+    waiting_upd_number = State()
+    waiting_receipt_date = State()
 
 
 class AdminForm(StatesGroup):
@@ -69,6 +74,10 @@ class AdminForm(StatesGroup):
     waiting_moderator_id = State()
     waiting_text_value = State()
     waiting_reject_reason = State()
+    waiting_promo_file = State()
+    waiting_sales_file = State()
+    waiting_sales_period = State()
+    waiting_auto_moderation_period = State()
 
 
 # ---------- Проверка прав доступа ----------
@@ -100,17 +109,20 @@ class IsModerator(BaseFilter):
 # ---------- Клавиатуры ----------
 
 BTN_SEND_RECEIPT = "📥 Отправить чек / УПД"
+BTN_MY_RECEIPTS = "📄 Загруженные чеки"
 BTN_RULES = "❓ Правила"
 
 ADMIN_BTN_HISTORY = "🗓 История"
 ADMIN_BTN_MODERATION = "🛠 Модерация"
 ADMIN_BTN_MODERATORS = "👥 Модераторы"
-ADMIN_BTN_REPORT = "📊 Отчёт"
+ADMIN_BTN_REPORT = "📊 Отчёты"
 ADMIN_BTN_TEXTS = "✏️ Тексты"
+ADMIN_BTN_IMPORT = "📥 Импорт"
 ADMIN_BTN_EXIT = "⬅️ Выйти из панели"
 
 _main_menu_builder = ReplyKeyboardBuilder()
 _main_menu_builder.button(text=BTN_SEND_RECEIPT)
+_main_menu_builder.button(text=BTN_MY_RECEIPTS)
 _main_menu_builder.button(text=BTN_RULES)
 _main_menu_builder.adjust(1)
 main_menu = _main_menu_builder.as_markup(resize_keyboard=True)
@@ -129,8 +141,9 @@ _owner_menu_builder.button(text=ADMIN_BTN_MODERATION)
 _owner_menu_builder.button(text=ADMIN_BTN_REPORT)
 _owner_menu_builder.button(text=ADMIN_BTN_MODERATORS)
 _owner_menu_builder.button(text=ADMIN_BTN_TEXTS)
+_owner_menu_builder.button(text=ADMIN_BTN_IMPORT)
 _owner_menu_builder.button(text=ADMIN_BTN_EXIT)
-_owner_menu_builder.adjust(2, 2, 2)
+_owner_menu_builder.adjust(2, 2, 2, 1)
 owner_menu = _owner_menu_builder.as_markup(resize_keyboard=True)
 
 
@@ -179,6 +192,28 @@ async def process_name(message: Message, state: FSMContext):
 @dp.message(StateFilter(Form.shop))
 async def process_shop(message: Message, state: FSMContext):
     await state.update_data(shop=message.text)
+    await state.set_state(Form.inn)
+    await message.answer(
+        "Теперь укажите ИНН магазина (10 цифр — для организации, "
+        "или 12 цифр — для ИП)."
+    )
+
+
+_INN_RE = re.compile(r"^\d{10}$|^\d{12}$")
+
+
+@dp.message(StateFilter(Form.inn), F.text)
+async def process_inn(message: Message, state: FSMContext):
+    inn = message.text.strip()
+
+    if not _INN_RE.match(inn):
+        await message.answer(
+            "ИНН должен состоять только из цифр — 10 цифр для организации "
+            "или 12 цифр для ИП. Введите ИНН ещё раз."
+        )
+        return
+
+    await state.update_data(inn=inn)
 
     kb_builder = ReplyKeyboardBuilder()
     kb_builder.button(text="Поделиться контактом", request_contact=True)
@@ -191,17 +226,24 @@ async def process_shop(message: Message, state: FSMContext):
     )
 
 
+@dp.message(StateFilter(Form.inn))
+async def wrong_content_for_inn(message: Message):
+    await message.answer("Пожалуйста, введите ИНН магазина текстом (только цифры).")
+
+
 @dp.message(StateFilter(Form.phone), F.contact)
 async def process_phone(message: Message, state: FSMContext):
     data = await state.get_data()
     full_name = data.get("name", "")
     shop = data.get("shop", "")
+    inn = data.get("inn", "")
     phone = message.contact.phone_number
 
     try:
         google_sheets.append_registration(
             full_name=full_name,
             shop=shop,
+            inn=inn,
             phone=phone,
             telegram_id=message.from_user.id,
             username=message.from_user.username,
@@ -249,12 +291,55 @@ async def process_photo(message: Message, state: FSMContext):
         logger.exception("Не удалось скачать фото чека")
         filepath = "(не скачалось)"
 
+    # Фото ещё не сохраняем в таблицу — сначала нужно получить от
+    # пользователя номер УПД и дату чека вручную, чтобы записать всё
+    # одной строкой.
+    await state.update_data(photo_file_id=file_id, photo_file_name=filepath)
+    await state.set_state(Form.waiting_upd_number)
+    await message.answer(google_sheets.get_text("ask_upd_number"))
+
+
+@dp.message(StateFilter(Form.waiting_photo))
+async def wrong_content_for_photo(message: Message):
+    await message.answer("Пожалуйста, пришлите именно фото (как изображение, не файлом).")
+
+
+@dp.message(StateFilter(Form.waiting_upd_number), F.text)
+async def process_upd_number(message: Message, state: FSMContext):
+    await state.update_data(upd_number=message.text.strip())
+    await state.set_state(Form.waiting_receipt_date)
+    await message.answer(google_sheets.get_text("ask_receipt_date"))
+
+
+@dp.message(StateFilter(Form.waiting_upd_number))
+async def wrong_content_for_upd_number(message: Message):
+    await message.answer("Пожалуйста, введите номер УПД текстом (одним сообщением).")
+
+
+_DATE_LIKE_RE = re.compile(r"^\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}$")
+
+
+@dp.message(StateFilter(Form.waiting_receipt_date), F.text)
+async def process_receipt_date(message: Message, state: FSMContext):
+    receipt_date = message.text.strip()
+
+    if not _DATE_LIKE_RE.match(receipt_date):
+        await message.answer(
+            "Похоже, это не дата. Введите дату чека в формате ДД.ММ.ГГГГ, "
+            "например 21.07.2026."
+        )
+        return
+
+    data = await state.get_data()
+
     try:
         google_sheets.append_receipt(
             telegram_id=message.from_user.id,
             username=message.from_user.username,
-            file_id=file_id,
-            file_name=filepath,
+            file_id=data.get("photo_file_id", ""),
+            file_name=data.get("photo_file_name", ""),
+            upd_number=data.get("upd_number", ""),
+            receipt_date=receipt_date,
         )
     except Exception:
         logger.exception("Не удалось записать чек в Google Таблицу")
@@ -266,9 +351,49 @@ async def process_photo(message: Message, state: FSMContext):
     )
 
 
-@dp.message(StateFilter(Form.waiting_photo))
-async def wrong_content_for_photo(message: Message):
-    await message.answer("Пожалуйста, пришлите именно фото (как изображение, не файлом).")
+@dp.message(StateFilter(Form.waiting_receipt_date))
+async def wrong_content_for_receipt_date(message: Message):
+    await message.answer("Пожалуйста, введите дату чека текстом, в формате ДД.ММ.ГГГГ.")
+
+
+# ---------- Загруженные чеки (для самого пользователя) ----------
+
+@dp.message(F.text == BTN_MY_RECEIPTS)
+async def my_receipts(message: Message):
+    await message.answer("Формирую отчёт по вашим чекам, секунду...")
+    try:
+        receipts = google_sheets.get_receipts_by_telegram_id(message.from_user.id)
+    except Exception:
+        logger.exception("Не удалось получить чеки пользователя из Google Таблицы")
+        await message.answer("Не получилось сформировать отчёт, попробуйте позже.")
+        return
+
+    if not receipts:
+        await message.answer("Вы ещё не загружали ни одного чека.")
+        return
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Мои чеки"
+    headers = ["Дата загрузки", "№ УПД", "Дата чека", "Статус", "Купон", "Комментарий"]
+    ws.append(headers)
+    for r in receipts:
+        ws.append([
+            r["date"],
+            r["upd_number"],
+            r["receipt_date"],
+            r["status"],
+            r["coupon"],
+            r["comment"],
+        ])
+    _autosize(ws, headers)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    filename = f"moi_cheki_{message.from_user.id}.xlsx"
+    await message.answer_document(BufferedInputFile(buf.read(), filename=filename))
 
 
 # ---------- Общая карточка чека (используется и в Истории, и в Модерации) ----------
@@ -287,6 +412,8 @@ async def _send_receipt_card(
     if reg:
         lines.append(f"ФИО: {reg['full_name']}")
         lines.append(f"Магазин: {reg['shop']}")
+        if reg.get("inn"):
+            lines.append(f"ИНН магазина: {reg['inn']}")
         lines.append(f"Телефон: {reg['phone']}")
     else:
         lines.append("Регистрация не найдена (данные могли не сохраниться).")
@@ -294,7 +421,11 @@ async def _send_receipt_card(
     lines.append(f"Telegram ID: {receipt['telegram_id']}")
     if receipt["username"]:
         lines.append(f"Username: @{receipt['username']}")
-    lines.append(f"Дата: {receipt['date']}")
+    lines.append(f"Дата загрузки: {receipt['date']}")
+    if receipt.get("upd_number"):
+        lines.append(f"№ УПД (введён пользователем): {receipt['upd_number']}")
+    if receipt.get("receipt_date"):
+        lines.append(f"Дата чека (введена пользователем): {receipt['receipt_date']}")
     lines.append(f"Статус: {receipt['status']}")
     if receipt.get("coupon"):
         lines.append(f"Купон: {receipt['coupon']}")
@@ -506,7 +637,14 @@ async def admin_history_delete_do(call: CallbackQuery):
 # ---------- Модерация чеков ----------
 
 @dp.message(F.text == ADMIN_BTN_MODERATION, IsModerator())
-async def admin_moderation_start(message: Message):
+async def admin_moderation_menu(message: Message):
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="📋 Список на модерации", callback_data="moderation_list"))
+    kb.row(InlineKeyboardButton(text="🤖 Автоматическая модерация", callback_data="moderation_auto"))
+    await message.answer("Что открыть?", reply_markup=kb.as_markup())
+
+
+async def _show_moderation_list(message: Message):
     try:
         receipts = google_sheets.get_pending_receipts()
     except Exception:
@@ -523,6 +661,12 @@ async def admin_moderation_start(message: Message):
         label = _format_receipt_label(r)
         builder.row(InlineKeyboardButton(text=f"{r['date']} — {label}", callback_data=f"mod_view:{r['row']}"))
     await message.answer("Чеки на модерации:", reply_markup=builder.as_markup())
+
+
+@dp.callback_query(F.data == "moderation_list", IsModerator())
+async def admin_moderation_list_cb(call: CallbackQuery):
+    await call.answer()
+    await _show_moderation_list(call.message)
 
 
 @dp.callback_query(F.data.startswith("mod_view:"), IsModerator())
@@ -785,6 +929,127 @@ async def admin_text_edit_finish(message: Message, state: FSMContext):
     await message.answer("Готово, текст обновлён.", reply_markup=owner_menu)
 
 
+# ---------- Импорт (акционные позиции / отчёт по продажам) ----------
+
+@dp.message(F.text == ADMIN_BTN_IMPORT, IsOwner())
+async def admin_import_menu(message: Message):
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="📦 Акционные позиции", callback_data="import_promo"))
+    kb.row(InlineKeyboardButton(text="📈 Отчёт по продажам", callback_data="import_sales"))
+    await message.answer(
+        "Что загружаем? Оба варианта — файл .xlsx, первая строка листа "
+        "должна быть заголовком (её содержимое не важно, бот её "
+        "пропускает и читает данные со 2-й строки).\n\n"
+        "📦 Акционные позиции — колонки: Артикул, Наименование. "
+        "Новая загрузка полностью заменяет предыдущий список.\n"
+        "📈 Отчёт по продажам — колонки: ИНН, Наименование, Артикул, "
+        "Количество, Цена, № УПД, Дата продажи. Новая загрузка "
+        "ДОБАВЛЯЕТСЯ к уже имеющимся данным (ничего не заменяется), и "
+        "каждая строка дополнительно помечается датой и временем именно "
+        "этой загрузки.",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data == "import_promo", IsOwner())
+async def admin_import_promo_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminForm.waiting_promo_file)
+    await call.message.answer(
+        "Пришлите файл .xlsx со списком акционных позиций "
+        "(колонки: Артикул, Наименование)."
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "import_sales", IsOwner())
+async def admin_import_sales_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminForm.waiting_sales_file)
+    await call.message.answer(
+        "Пришлите файл .xlsx с отчётом по продажам (колонки: ИНН, "
+        "Наименование, Артикул, Количество, Цена, № УПД, Дата продажи)."
+    )
+    await call.answer()
+
+
+def _read_xlsx_rows(file_bytes: io.BytesIO, min_columns: int):
+    """Читает .xlsx: первая строка — заголовок (пропускается), из
+    остальных строк берёт первые min_columns колонок текстом. Полностью
+    пустые строки пропускаются."""
+    wb = openpyxl.load_workbook(file_bytes, data_only=True)
+    ws = wb.active
+    rows = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row is None or all(cell in (None, "") for cell in row):
+            continue
+        values = ["" if cell is None else str(cell).strip() for cell in row[:min_columns]]
+        if len(values) < min_columns:
+            values += [""] * (min_columns - len(values))
+        rows.append(values)
+    return rows
+
+
+async def _download_document(message: Message) -> io.BytesIO:
+    buf = io.BytesIO()
+    await bot.download(message.document.file_id, destination=buf)
+    buf.seek(0)
+    return buf
+
+
+@dp.message(StateFilter(AdminForm.waiting_promo_file), F.document)
+async def admin_import_promo_finish(message: Message, state: FSMContext):
+    if not message.document.file_name.lower().endswith((".xlsx", ".xlsm")):
+        await message.answer("Нужен файл в формате .xlsx. Пришлите файл ещё раз.")
+        return
+
+    try:
+        buf = await _download_document(message)
+        rows = _read_xlsx_rows(buf, min_columns=2)
+        google_sheets.import_promo_items(rows)
+    except Exception:
+        logger.exception("Не удалось импортировать акционные позиции")
+        await message.answer(
+            "Не получилось прочитать файл. Проверьте формат и попробуйте ещё раз.",
+        )
+        return
+
+    await state.clear()
+    await message.answer(f"Готово, загружено позиций: {len(rows)}.", reply_markup=owner_menu)
+
+
+@dp.message(StateFilter(AdminForm.waiting_promo_file))
+async def wrong_content_for_promo_file(message: Message):
+    await message.answer("Пожалуйста, пришлите файл .xlsx (документом).")
+
+
+@dp.message(StateFilter(AdminForm.waiting_sales_file), F.document)
+async def admin_import_sales_finish(message: Message, state: FSMContext):
+    if not message.document.file_name.lower().endswith((".xlsx", ".xlsm")):
+        await message.answer("Нужен файл в формате .xlsx. Пришлите файл ещё раз.")
+        return
+
+    try:
+        buf = await _download_document(message)
+        rows = _read_xlsx_rows(buf, min_columns=7)
+        google_sheets.import_sales_report(rows)
+    except Exception:
+        logger.exception("Не удалось импортировать отчёт по продажам")
+        await message.answer(
+            "Не получилось прочитать файл. Проверьте формат и попробуйте ещё раз.",
+        )
+        return
+
+    await state.clear()
+    await message.answer(
+        f"Готово, добавлено строк: {len(rows)} (дата загрузки проставлена автоматически).",
+        reply_markup=owner_menu,
+    )
+
+
+@dp.message(StateFilter(AdminForm.waiting_sales_file))
+async def wrong_content_for_sales_file(message: Message):
+    await message.answer("Пожалуйста, пришлите файл .xlsx (документом).")
+
+
 # ---------- Отчёт в Excel ----------
 
 def _autosize(ws, headers):
@@ -801,19 +1066,22 @@ def _build_report_workbook() -> io.BytesIO:
     ws_receipts = wb.active
     ws_receipts.title = "Чеки"
     receipt_headers = [
-        "Дата чека", "Дата регистрации", "Telegram ID", "Username", "ФИО", "Магазин", "Телефон",
-        "Статус", "Купон", "Комментарий", "Удалён",
+        "Дата загрузки", "№ УПД", "Дата чека", "Дата регистрации", "Telegram ID", "Username",
+        "ФИО", "Магазин", "ИНН магазина", "Телефон", "Статус", "Купон", "Комментарий", "Удалён",
     ]
     ws_receipts.append(receipt_headers)
     for r in google_sheets.get_receipts():
         reg = reg_by_id.get(r["telegram_id"])
         ws_receipts.append([
             r["date"],
+            r["upd_number"],
+            r["receipt_date"],
             reg["date"] if reg else "",
             r["telegram_id"],
             r["username"],
             reg["full_name"] if reg else "",
             reg["shop"] if reg else "",
+            reg["inn"] if reg else "",
             reg["phone"] if reg else "",
             r["status"],
             r["coupon"],
@@ -823,10 +1091,10 @@ def _build_report_workbook() -> io.BytesIO:
     _autosize(ws_receipts, receipt_headers)
 
     ws_reg = wb.create_sheet("Регистрации")
-    reg_headers = ["Дата регистрации", "ФИО", "Магазин", "Телефон", "Telegram ID", "Username"]
+    reg_headers = ["Дата регистрации", "ФИО", "Магазин", "ИНН магазина", "Телефон", "Telegram ID", "Username"]
     ws_reg.append(reg_headers)
     for reg in registrations:
-        ws_reg.append([reg["date"], reg["full_name"], reg["shop"], reg["phone"], reg["telegram_id"], reg["username"]])
+        ws_reg.append([reg["date"], reg["full_name"], reg["shop"], reg["inn"], reg["phone"], reg["telegram_id"], reg["username"]])
     _autosize(ws_reg, reg_headers)
 
     buf = io.BytesIO()
@@ -836,17 +1104,291 @@ def _build_report_workbook() -> io.BytesIO:
 
 
 @dp.message(F.text == ADMIN_BTN_REPORT, IsModerator())
-async def admin_report(message: Message):
-    await message.answer("Формирую отчёт, секунду...")
+async def admin_reports_menu(message: Message):
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="📄 Общий отчёт", callback_data="report_general"))
+    kb.row(InlineKeyboardButton(text="🔎 Отчёт по продажам", callback_data="report_sales_match"))
+    await message.answer("Какой отчёт сформировать?", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "report_general", IsModerator())
+async def admin_report_general(call: CallbackQuery):
+    await call.answer()
+    await call.message.answer("Формирую отчёт, секунду...")
     try:
         buf = _build_report_workbook()
     except Exception:
         logger.exception("Не удалось сформировать отчёт")
-        await message.answer("Не получилось сформировать отчёт, попробуйте позже.")
+        await call.message.answer("Не получилось сформировать отчёт, попробуйте позже.")
         return
 
     filename = f"report_{google_sheets.moscow_today().strftime('%Y%m%d')}.xlsx"
-    await message.answer_document(BufferedInputFile(buf.read(), filename=filename))
+    await call.message.answer_document(BufferedInputFile(buf.read(), filename=filename))
+
+
+# ---------- Отчёт по продажам (сверка чеков с отчётом по продажам) ----------
+
+def _parse_date_loose(text: str):
+    """Разбирает дату в разных написаниях (точки/дефисы/слэши, 2 или 4
+    цифры года) в объект date. Возвращает None, если не получилось."""
+    if not text:
+        return None
+    normalized = re.sub(r"[/\-]", ".", text.strip())
+    parts = normalized.split(".")
+    if len(parts) != 3:
+        return None
+    day_s, month_s, year_s = parts
+    if len(year_s) == 2:
+        year_s = "20" + year_s
+    try:
+        return date(int(year_s), int(month_s), int(day_s))
+    except ValueError:
+        return None
+
+
+_PERIOD_RE = re.compile(r"^(.+?)\s*-\s*(.+)$")
+
+
+@dp.callback_query(F.data == "report_sales_match", IsModerator())
+async def admin_report_sales_match_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminForm.waiting_sales_period)
+    await call.message.answer(
+        "Пришлите период для сверки в формате ДД.ММ.ГГГГ - ДД.ММ.ГГГГ, "
+        "например 01.07.2026 - 22.07.2026.\n\n"
+        "Бот сверит чеки с датой чека в этом периоде (у которых указаны "
+        "ИНН, номер УПД и дата) с загруженным отчётом по продажам: "
+        "совпадением считается одинаковые ИНН + № УПД + дата продажи, "
+        "и хотя бы один товар по этому УПД — из списка акционных позиций."
+    )
+    await call.answer()
+
+
+def _build_sales_match_workbook(start_date: date, end_date: date):
+    """Сверяет чеки (ИНН магазина + № УПД + дата чека) с отчётом по
+    продажам (ИНН + № УПД + дата продажи), проверяя, что хотя бы один
+    товар по этому УПД входит в список акционных позиций. Возвращает
+    (буфер с Excel, число совпадений-строк, число чеков без совпадения,
+    список номеров строк чеков, у которых нашлось хотя бы одно
+    совпадение — используется для массовой смены статуса)."""
+    promo_articles = {
+        item["article"].strip() for item in google_sheets.get_promo_items() if item["article"].strip()
+    }
+
+    sales_index = {}
+    for s in google_sheets.get_sales_report():
+        sale_date = _parse_date_loose(s["sale_date"])
+        if not sale_date:
+            continue
+        key = (s["inn"].strip(), s["upd_number"].strip(), sale_date)
+        sales_index.setdefault(key, []).append(s)
+
+    matched = []
+    unmatched = []
+
+    for r in google_sheets.get_receipts():
+        if r["deleted"] or not r["upd_number"] or not r["receipt_date"]:
+            continue
+
+        receipt_date = _parse_date_loose(r["receipt_date"])
+        if not receipt_date or not (start_date <= receipt_date <= end_date):
+            continue
+
+        reg = google_sheets.get_registration_by_telegram_id(r["telegram_id"])
+        inn = (reg.get("inn") or "").strip() if reg else ""
+
+        if not inn:
+            unmatched.append((r, reg, "у пользователя не указан ИНН магазина"))
+            continue
+
+        sale_lines = sales_index.get((inn, r["upd_number"].strip(), receipt_date), [])
+        promo_lines = [s for s in sale_lines if s["article"].strip() in promo_articles]
+
+        if promo_lines:
+            for s in promo_lines:
+                matched.append((r, reg, s))
+        elif sale_lines:
+            unmatched.append((r, reg, "товары по этому УПД не входят в акционные позиции"))
+        else:
+            unmatched.append((r, reg, "нет строки в отчёте по продажам с таким ИНН/№ УПД/датой"))
+
+    wb = openpyxl.Workbook()
+
+    ws_matched = wb.active
+    ws_matched.title = "Совпадения"
+    matched_headers = [
+        "Дата чека", "№ УПД", "Telegram ID", "Username", "ФИО", "Магазин", "ИНН магазина",
+        "Артикул", "Наименование товара", "Количество", "Цена",
+    ]
+    ws_matched.append(matched_headers)
+    for r, reg, s in matched:
+        ws_matched.append([
+            r["receipt_date"], r["upd_number"], r["telegram_id"], r["username"],
+            reg["full_name"] if reg else "", reg["shop"] if reg else "", reg["inn"] if reg else "",
+            s["article"], s["name"], s["quantity"], s["price"],
+        ])
+    _autosize(ws_matched, matched_headers)
+
+    ws_unmatched = wb.create_sheet("Без совпадений")
+    unmatched_headers = [
+        "Дата чека", "№ УПД", "Telegram ID", "Username", "ФИО", "Магазин", "ИНН магазина", "Причина",
+    ]
+    ws_unmatched.append(unmatched_headers)
+    for r, reg, reason in unmatched:
+        ws_unmatched.append([
+            r["receipt_date"], r["upd_number"], r["telegram_id"], r["username"],
+            reg["full_name"] if reg else "", reg["shop"] if reg else "", reg["inn"] if reg else "", reason,
+        ])
+    _autosize(ws_unmatched, unmatched_headers)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    matched_rows = sorted({r["row"] for r, _reg, _s in matched})
+    return buf, len(matched), len(unmatched), matched_rows
+
+
+@dp.message(StateFilter(AdminForm.waiting_sales_period), F.text)
+async def admin_report_sales_match_finish(message: Message, state: FSMContext):
+    m = _PERIOD_RE.match(message.text.strip())
+    start_date = end_date = None
+    if m:
+        start_date = _parse_date_loose(m.group(1))
+        end_date = _parse_date_loose(m.group(2))
+
+    if not m or not start_date or not end_date or start_date > end_date:
+        await message.answer(
+            "Не получилось разобрать период. Введите в формате "
+            "ДД.ММ.ГГГГ - ДД.ММ.ГГГГ, например 01.07.2026 - 22.07.2026."
+        )
+        return
+
+    await message.answer("Сверяю данные, секунду...")
+
+    try:
+        buf, matched_count, unmatched_count, _matched_rows = _build_sales_match_workbook(start_date, end_date)
+    except Exception:
+        logger.exception("Не удалось выполнить сверку продаж")
+        await message.answer("Не получилось выполнить сверку, попробуйте позже.")
+        await state.clear()
+        return
+
+    await state.clear()
+    filename = f"sverka_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+    await message.answer_document(
+        BufferedInputFile(buf.read(), filename=filename),
+        caption=f"Совпадений: {matched_count}. Без совпадений: {unmatched_count}.",
+        reply_markup=_menu_for(message.from_user.id),
+    )
+
+
+@dp.message(StateFilter(AdminForm.waiting_sales_period))
+async def wrong_content_for_sales_period(message: Message):
+    await message.answer("Пожалуйста, пришлите период текстом, в формате ДД.ММ.ГГГГ - ДД.ММ.ГГГГ.")
+
+
+# ---------- Автоматическая модерация (та же сверка + смена статуса) ----------
+
+@dp.callback_query(F.data == "moderation_auto", IsModerator())
+async def admin_moderation_auto_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminForm.waiting_auto_moderation_period)
+    await call.message.answer(
+        "Пришлите период для автоматической модерации в формате "
+        "ДД.ММ.ГГГГ - ДД.ММ.ГГГГ, например 01.07.2026 - 22.07.2026.\n\n"
+        "Бот сверит чеки за этот период с отчётом по продажам (так же, "
+        "как «📊 Отчёты» -> «🔎 Отчёт по продажам»), пришлёт Excel и "
+        "предложит сразу проставить статус «принят» найденным "
+        "совпадениям."
+    )
+    await call.answer()
+
+
+@dp.message(StateFilter(AdminForm.waiting_auto_moderation_period), F.text)
+async def admin_moderation_auto_finish(message: Message, state: FSMContext):
+    m = _PERIOD_RE.match(message.text.strip())
+    start_date = end_date = None
+    if m:
+        start_date = _parse_date_loose(m.group(1))
+        end_date = _parse_date_loose(m.group(2))
+
+    if not m or not start_date or not end_date or start_date > end_date:
+        await message.answer(
+            "Не получилось разобрать период. Введите в формате "
+            "ДД.ММ.ГГГГ - ДД.ММ.ГГГГ, например 01.07.2026 - 22.07.2026."
+        )
+        return
+
+    await message.answer("Сверяю данные, секунду...")
+
+    try:
+        buf, matched_count, unmatched_count, matched_rows = _build_sales_match_workbook(start_date, end_date)
+    except Exception:
+        logger.exception("Не удалось выполнить автоматическую модерацию")
+        await message.answer("Не получилось выполнить сверку, попробуйте позже.")
+        await state.clear()
+        return
+
+    filename = f"avto_moderatsiya_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+    await message.answer_document(
+        BufferedInputFile(buf.read(), filename=filename),
+        caption=(
+            f"Совпадений: {matched_count}. Без совпадений: {unmatched_count}. "
+            f"Уникальных чеков с совпадением: {len(matched_rows)}."
+        ),
+    )
+
+    if not matched_rows:
+        await state.clear()
+        await message.answer("Менять нечего — совпадений не найдено.", reply_markup=_menu_for(message.from_user.id))
+        return
+
+    await state.update_data(matched_rows=matched_rows)
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="✅ Да", callback_data="auto_mod_apply_yes"),
+        InlineKeyboardButton(text="❌ Нет", callback_data="auto_mod_apply_no"),
+    )
+    await message.answer(
+        f"Изменить статус чеков на «принят» у {len(matched_rows)} шт. "
+        "(совпавших по ИНН/№ УПД/дате продажи с акционным товаром)? "
+        "Пользователям сообщение отправлено НЕ будет — купон в этом "
+        "сценарии не назначается, меняется только статус в таблице.",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data == "auto_mod_apply_yes", IsModerator())
+async def admin_moderation_auto_apply_yes(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    rows = data.get("matched_rows", [])
+    await state.clear()
+    await call.answer()
+
+    updated = 0
+    for row in rows:
+        try:
+            google_sheets.update_receipt_status(
+                row,
+                google_sheets.STATUS_ACCEPTED,
+                comment="Подтверждено автоматической сверкой с отчётом по продажам",
+            )
+            updated += 1
+        except Exception:
+            logger.exception("Не удалось обновить статус чека %s при автомодерации", row)
+
+    await call.message.answer(f"Готово, статус изменён у {updated} из {len(rows)} чеков.")
+
+
+@dp.callback_query(F.data == "auto_mod_apply_no", IsModerator())
+async def admin_moderation_auto_apply_no(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.answer()
+    await call.message.answer("Хорошо, статусы не менял.")
+
+
+@dp.message(StateFilter(AdminForm.waiting_auto_moderation_period))
+async def wrong_content_for_auto_moderation_period(message: Message):
+    await message.answer("Пожалуйста, пришлите период текстом, в формате ДД.ММ.ГГГГ - ДД.ММ.ГГГГ.")
 
 
 async def main():
