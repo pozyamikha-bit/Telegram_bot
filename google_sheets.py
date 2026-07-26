@@ -291,10 +291,10 @@ def get_registration_by_telegram_id(telegram_id):
     for rec in reversed(records):
         if str(rec.get("Telegram ID", "")) == telegram_id:
             return {
-                "full_name": rec.get("ФИО", ""),
-                "shop": rec.get("Магазин", ""),
-                "phone": rec.get("Телефон", ""),
-                "inn": rec.get("ИНН магазина", ""),
+                "full_name": str(rec.get("ФИО", "")),
+                "shop": str(rec.get("Магазин", "")),
+                "phone": str(rec.get("Телефон", "")),
+                "inn": str(rec.get("ИНН магазина", "")),
             }
     return None
 
