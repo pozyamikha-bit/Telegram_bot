@@ -1029,6 +1029,39 @@ def _read_xlsx_rows(file_bytes: io.BytesIO, min_columns: int):
     return rows
 
 
+def _looks_like_product_name(value: str) -> bool:
+    """Грубая эвристика: похоже ли значение скорее на наименование
+    товара, чем на короткий код артикула (длинная строка и/или
+    несколько слов с кириллицей). Используется только для
+    предупреждения администратора, если он, похоже, перепутал местами
+    колонки «Артикул» и «Наименование» при подготовке файла — сам
+    импорт при этом всё равно проходит как есть."""
+    v = value.strip()
+    if not v:
+        return False
+    if len(v) > 35:
+        return True
+    return bool(re.search(r"[а-яА-ЯёЁ]", v)) and len(v.split()) >= 3
+
+
+def _column_swap_warning(rows, article_index: int) -> str:
+    """Если у большинства строк значение в колонке артикула похоже на
+    наименование товара, возвращает предупреждающий текст (иначе — "")."""
+    if not rows:
+        return ""
+    suspicious = sum(1 for row in rows if _looks_like_product_name(row[article_index]))
+    if suspicious / len(rows) <= 0.3:
+        return ""
+    return (
+        "\n\n⚠️ Внимание: у большинства строк в колонке «Артикул» — "
+        "длинные текстовые описания, а не короткие коды. Похоже, в файле "
+        "перепутаны местами колонки «Артикул» и «Наименование» "
+        "(наименование должно идти ПОСЛЕ артикула). Проверьте файл и "
+        "загрузите заново, если это так — импорт полностью заменяет "
+        "предыдущий список, так что это безопасно повторить."
+    )
+
+
 async def _download_document(message: Message) -> io.BytesIO:
     buf = io.BytesIO()
     await bot.download(message.document.file_id, destination=buf)
@@ -1054,7 +1087,8 @@ async def admin_import_promo_finish(message: Message, state: FSMContext):
         return
 
     await state.clear()
-    await message.answer(f"Готово, загружено позиций: {len(rows)}.", reply_markup=owner_menu)
+    warning = _column_swap_warning(rows, article_index=0)
+    await message.answer(f"Готово, загружено позиций: {len(rows)}.{warning}", reply_markup=owner_menu)
 
 
 @dp.message(StateFilter(AdminForm.waiting_promo_file))
@@ -1080,8 +1114,9 @@ async def admin_import_sales_finish(message: Message, state: FSMContext):
         return
 
     await state.clear()
+    warning = _column_swap_warning(rows, article_index=2)
     await message.answer(
-        f"Готово, добавлено строк: {len(rows)} (дата загрузки проставлена автоматически).",
+        f"Готово, добавлено строк: {len(rows)} (дата загрузки проставлена автоматически).{warning}",
         reply_markup=owner_menu,
     )
 
