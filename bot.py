@@ -119,6 +119,7 @@ ADMIN_BTN_MODERATORS = "👥 Модераторы"
 ADMIN_BTN_REPORT = "📊 Отчёты"
 ADMIN_BTN_TEXTS = "✏️ Тексты"
 ADMIN_BTN_IMPORT = "📥 Импорт"
+ADMIN_BTN_TEMPLATES = "🗂 Шаблоны"
 ADMIN_BTN_EXIT = "⬅️ Выйти из панели"
 
 _main_menu_builder = ReplyKeyboardBuilder()
@@ -143,8 +144,9 @@ _owner_menu_builder.button(text=ADMIN_BTN_REPORT)
 _owner_menu_builder.button(text=ADMIN_BTN_MODERATORS)
 _owner_menu_builder.button(text=ADMIN_BTN_TEXTS)
 _owner_menu_builder.button(text=ADMIN_BTN_IMPORT)
+_owner_menu_builder.button(text=ADMIN_BTN_TEMPLATES)
 _owner_menu_builder.button(text=ADMIN_BTN_EXIT)
-_owner_menu_builder.adjust(2, 2, 2, 1)
+_owner_menu_builder.adjust(2, 2, 2, 2)
 owner_menu = _owner_menu_builder.as_markup(resize_keyboard=True)
 
 
@@ -969,7 +971,9 @@ async def admin_import_menu(message: Message):
         "Количество, Цена, № УПД, Дата продажи. Новая загрузка "
         "ДОБАВЛЯЕТСЯ к уже имеющимся данным (ничего не заменяется), и "
         "каждая строка дополнительно помечается датой и временем именно "
-        "этой загрузки.",
+        "этой загрузки.\n\n"
+        "Если нужен пустой шаблон файла для заполнения — загляните в "
+        f"«{ADMIN_BTN_TEMPLATES}».",
         reply_markup=kb.as_markup(),
     )
 
@@ -1124,6 +1128,56 @@ async def admin_import_sales_finish(message: Message, state: FSMContext):
 @dp.message(StateFilter(AdminForm.waiting_sales_file))
 async def wrong_content_for_sales_file(message: Message):
     await message.answer("Пожалуйста, пришлите файл .xlsx (документом).")
+
+
+# ---------- Шаблоны для импорта ----------
+
+TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+
+# callback_data -> (имя файла в папке templates/, подпись к документу)
+TEMPLATE_FILES = {
+    "template_promo": (
+        "promo_items_template.xlsx",
+        "Шаблон для импорта акционных позиций. Колонки: Артикул, "
+        "Наименование (именно в этом порядке — первая колонка короткий "
+        "код артикула, вторая текстовое наименование товара).",
+    ),
+    "template_sales": (
+        "sales_report_template.xlsx",
+        "Шаблон для импорта отчёта по продажам. Колонки: ИНН, "
+        "Наименование, Артикул, Количество, Цена, № УПД, Дата продажи.",
+    ),
+}
+
+
+@dp.message(F.text == ADMIN_BTN_TEMPLATES, IsOwner())
+async def admin_templates_menu(message: Message):
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="📦 Акционные позиции", callback_data="template_promo"))
+    kb.row(InlineKeyboardButton(text="📈 Отчёт по продажам", callback_data="template_sales"))
+    await message.answer("Какой шаблон для импорта прислать?", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data.in_(TEMPLATE_FILES.keys()), IsOwner())
+async def admin_templates_send(call: CallbackQuery):
+    filename, caption = TEMPLATE_FILES[call.data]
+    path = os.path.join(TEMPLATES_DIR, filename)
+    await call.answer()
+
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        logger.exception("Не найден файл шаблона: %s", path)
+        await call.message.answer(
+            "Не получилось найти файл шаблона на сервере "
+            f"(ожидался файл templates/{filename} рядом с bot.py). "
+            "Убедитесь, что папка «templates» загружена вместе с "
+            "остальным кодом бота при деплое."
+        )
+        return
+
+    await call.message.answer_document(BufferedInputFile(data, filename=filename), caption=caption)
 
 
 # ---------- Отчёт в Excel ----------
