@@ -1217,11 +1217,21 @@ def _build_sales_match_workbook(start_date: date, end_date: date):
     }
 
     sales_index = {}
+    # Индекс "только по № УПД" — нужен исключительно для диагностики:
+    # если строка по ИНН+УПД+дате не нашлась, но строки с таким же № УПД
+    # в отчёте есть, покажем админу, чем именно они отличаются (другой
+    # ИНН, другая дата, дата не распозналась и т.п.), не заставляя лезть
+    # в саму Google Таблицу и гадать.
+    sales_by_upd = {}
     for s in google_sheets.get_sales_report():
+        upd = s["upd_number"].strip()
+        inn_s = s["inn"].strip()
         sale_date = _parse_date_loose(s["sale_date"])
+        if upd:
+            sales_by_upd.setdefault(upd, []).append((inn_s, sale_date, s["sale_date"]))
         if not sale_date:
             continue
-        key = (s["inn"].strip(), s["upd_number"].strip(), sale_date)
+        key = (inn_s, upd, sale_date)
         sales_index.setdefault(key, []).append(s)
 
     matched = []
@@ -1237,21 +1247,48 @@ def _build_sales_match_workbook(start_date: date, end_date: date):
 
         reg = google_sheets.get_registration_by_telegram_id(r["telegram_id"])
         inn = (reg.get("inn") or "").strip() if reg else ""
+        upd_number = r["upd_number"].strip()
 
         if not inn:
-            unmatched.append((r, reg, "у пользователя не указан ИНН магазина"))
+            unmatched.append((r, reg, "у пользователя не указан ИНН магазина", ""))
             continue
 
-        sale_lines = sales_index.get((inn, r["upd_number"].strip(), receipt_date), [])
+        sale_lines = sales_index.get((inn, upd_number, receipt_date), [])
         promo_lines = [s for s in sale_lines if s["article"].strip() in promo_articles]
 
         if promo_lines:
             for s in promo_lines:
                 matched.append((r, reg, s))
-        elif sale_lines:
-            unmatched.append((r, reg, "товары по этому УПД не входят в акционные позиции"))
+            continue
+
+        if sale_lines:
+            found_articles = sorted({s["article"].strip() for s in sale_lines if s["article"].strip()})
+            detail = (
+                f"В отчёте по этому № УПД указаны артикулы: {', '.join(found_articles) or '—'} "
+                "— ни один из них не входит в список акционных позиций."
+            )
+            unmatched.append((r, reg, "товары по этому УПД не входят в акционные позиции", detail))
+            continue
+
+        candidates = sales_by_upd.get(upd_number, [])
+        if candidates:
+            details = []
+            for cand_inn, cand_date, cand_raw in candidates[:3]:
+                if cand_date:
+                    cand_date_str = cand_date.strftime("%d.%m.%Y")
+                else:
+                    cand_date_str = f"не удалось разобрать дату ('{cand_raw}')"
+                if cand_inn != inn:
+                    details.append(f"в отчёте по этому УПД ИНН «{cand_inn or '—'}», у пользователя «{inn}»")
+                elif cand_date != receipt_date:
+                    details.append(f"в отчёте по этому УПД дата «{cand_date_str}», дата чека «{receipt_date.strftime('%d.%m.%Y')}»")
+                else:
+                    details.append("ИНН и дата совпадают, но строка не нашлась при поиске — сообщите разработчику")
+            detail = "Похожие строки в отчёте по продажам есть, но не совпадают: " + "; ".join(details)
         else:
-            unmatched.append((r, reg, "нет строки в отчёте по продажам с таким ИНН/№ УПД/датой"))
+            detail = "В отчёте по продажам нет ни одной строки с таким № УПД вообще."
+
+        unmatched.append((r, reg, "нет строки в отчёте по продажам с таким ИНН/№ УПД/датой", detail))
 
     wb = openpyxl.Workbook()
 
@@ -1272,15 +1309,16 @@ def _build_sales_match_workbook(start_date: date, end_date: date):
 
     ws_unmatched = wb.create_sheet("Без совпадений")
     unmatched_headers = [
-        "Дата чека", "№ УПД", "Telegram ID", "Username", "ФИО", "Магазин", "ИНН магазина", "Причина",
+        "Дата чека", "№ УПД", "Telegram ID", "Username", "ФИО", "Магазин", "ИНН магазина", "Причина", "Подробности",
     ]
     ws_unmatched.append(unmatched_headers)
-    for r, reg, reason in unmatched:
+    for r, reg, reason, detail in unmatched:
         ws_unmatched.append([
             r["receipt_date"], r["upd_number"], r["telegram_id"], r["username"],
-            reg["full_name"] if reg else "", reg["shop"] if reg else "", reg["inn"] if reg else "", reason,
+            reg["full_name"] if reg else "", reg["shop"] if reg else "", reg["inn"] if reg else "", reason, detail,
         ])
     _autosize(ws_unmatched, unmatched_headers)
+    ws_unmatched.column_dimensions[get_column_letter(len(unmatched_headers))].width = 70
 
     buf = io.BytesIO()
     wb.save(buf)
