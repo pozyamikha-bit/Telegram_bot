@@ -77,8 +77,11 @@ class AdminForm(StatesGroup):
     waiting_reject_reason = State()
     waiting_promo_file = State()
     waiting_sales_file = State()
+    waiting_coupons_file = State()
     picking_period = State()
     auto_mod_confirm = State()
+    waiting_inn_fix = State()
+    coupons_confirm = State()
 
 
 # ---------- Проверка прав доступа ----------
@@ -111,6 +114,7 @@ class IsModerator(BaseFilter):
 
 BTN_SEND_RECEIPT = "📥 Отправить чек / УПД"
 BTN_MY_RECEIPTS = "📄 Загруженные чеки"
+BTN_DELETE_RECEIPTS = "🗑 Удалить чеки"
 BTN_RULES = "❓ Правила"
 
 ADMIN_BTN_HISTORY = "🗓 История"
@@ -125,6 +129,7 @@ ADMIN_BTN_EXIT = "⬅️ Выйти из панели"
 _main_menu_builder = ReplyKeyboardBuilder()
 _main_menu_builder.button(text=BTN_SEND_RECEIPT)
 _main_menu_builder.button(text=BTN_MY_RECEIPTS)
+_main_menu_builder.button(text=BTN_DELETE_RECEIPTS)
 _main_menu_builder.button(text=BTN_RULES)
 _main_menu_builder.adjust(1)
 main_menu = _main_menu_builder.as_markup(resize_keyboard=True)
@@ -348,7 +353,24 @@ async def wrong_content_for_photo(message: Message):
 
 @dp.message(StateFilter(Form.waiting_upd_number), F.text)
 async def process_upd_number(message: Message, state: FSMContext):
-    await state.update_data(upd_number=message.text.strip())
+    upd_number = message.text.strip()
+
+    try:
+        duplicate = google_sheets.find_active_receipt_by_upd(upd_number)
+    except Exception:
+        logger.exception("Не удалось проверить № УПД на повтор")
+        duplicate = None
+
+    if duplicate:
+        await message.answer(
+            "Этот номер УПД уже был подан ранее (один чек — один купон "
+            "Ozon, повторно использовать тот же № УПД нельзя). Проверьте "
+            "номер и введите его ещё раз, либо нажмите «Отмена».",
+            reply_markup=_cancel_kb(),
+        )
+        return
+
+    await state.update_data(upd_number=upd_number)
     await state.set_state(Form.waiting_receipt_date)
     today = google_sheets.moscow_today()
     await message.answer(
@@ -410,13 +432,37 @@ async def receipt_calendar_pick_day(call: CallbackQuery, state: FSMContext):
     receipt_date = f"{day_s}.{month_s}.{year_s}"
 
     data = await state.get_data()
+    upd_number = data.get("upd_number", "")
+
+    # Повторная проверка прямо перед записью — на случай, если пока
+    # пользователь выбирал дату, кто-то другой успел подать тот же № УПД
+    # (проверка на шаге ввода номера УПД саму по себе не гарантирует
+    # отсутствие "гонки" между двумя параллельными заявками).
+    try:
+        duplicate = google_sheets.find_active_receipt_by_upd(upd_number)
+    except Exception:
+        logger.exception("Не удалось повторно проверить № УПД перед записью")
+        duplicate = None
+
+    if duplicate:
+        await state.clear()
+        await call.message.edit_reply_markup(reply_markup=None)
+        await call.message.answer(
+            "Этот номер УПД уже был подан (кто-то успел раньше). Загрузка "
+            "чека отменена — если считаете это ошибкой, обратитесь к "
+            "администратору.",
+            reply_markup=main_menu,
+        )
+        await call.answer()
+        return
+
     try:
         google_sheets.append_receipt(
             telegram_id=call.from_user.id,
             username=call.from_user.username,
             file_id=data.get("photo_file_id", ""),
             file_name=data.get("photo_file_name", ""),
-            upd_number=data.get("upd_number", ""),
+            upd_number=upd_number,
             receipt_date=receipt_date,
         )
     except Exception:
@@ -484,6 +530,140 @@ async def my_receipts(message: Message):
     await message.answer_document(BufferedInputFile(buf.read(), filename=filename))
 
 
+# ---------- Удаление своих чеков (для самого пользователя) ----------
+
+async def _send_own_receipts_list(message: Message, user_id: int):
+    try:
+        receipts = google_sheets.get_receipts_by_telegram_id(user_id, include_deleted=False)
+    except Exception:
+        logger.exception("Не удалось получить чеки пользователя для удаления")
+        await message.answer("Не получилось получить список чеков, попробуйте позже.")
+        return
+
+    if not receipts:
+        await message.answer("У вас нет загруженных чеков, которые можно удалить.")
+        return
+
+    kb = InlineKeyboardBuilder()
+    for r in receipts:
+        parts = []
+        if r.get("upd_number"):
+            parts.append(f"УПД {r['upd_number']}")
+        else:
+            parts.append("без № УПД")
+        if r.get("receipt_date"):
+            parts.append(r["receipt_date"])
+        label = _truncate(" · ".join(parts), 60)
+        kb.row(InlineKeyboardButton(text=label, callback_data=f"my_del_view:{r['row']}"))
+
+    await message.answer("Выберите чек, который нужно удалить:", reply_markup=kb.as_markup())
+
+
+@dp.message(F.text == BTN_DELETE_RECEIPTS)
+async def my_receipts_delete_menu(message: Message):
+    await _send_own_receipts_list(message, message.from_user.id)
+
+
+async def _send_own_receipt_card(message: Message, receipt: dict):
+    lines = [
+        f"№ УПД: {receipt['upd_number'] or '—'}",
+        f"Дата чека: {receipt['receipt_date'] or '—'}",
+        f"Дата загрузки: {receipt['date']}",
+        f"Статус: {receipt['status']}",
+    ]
+    if receipt.get("coupon"):
+        lines.append(f"Купон: {receipt['coupon']}")
+    if receipt.get("comment"):
+        lines.append(f"Комментарий: {receipt['comment']}")
+    caption = "\n".join(lines)
+
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🗑 Удалить чек", callback_data=f"my_del_confirm:{receipt['row']}"))
+    kb.row(InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="my_del_back"))
+    reply_markup = kb.as_markup()
+
+    if receipt["file_id"]:
+        try:
+            await message.answer_photo(receipt["file_id"], caption=caption, reply_markup=reply_markup)
+            return
+        except Exception:
+            logger.exception("Не удалось отправить фото чека пользователю (удаление чеков)")
+
+    await message.answer(caption, reply_markup=reply_markup)
+
+
+def _owns_receipt(receipt: dict, user_id: int) -> bool:
+    return bool(receipt) and receipt["telegram_id"] == str(user_id)
+
+
+@dp.callback_query(F.data.startswith("my_del_view:"))
+async def my_receipts_delete_view(call: CallbackQuery):
+    row = int(call.data.split(":", 1)[1])
+    receipt = google_sheets.get_receipt_by_row(row)
+    if not _owns_receipt(receipt, call.from_user.id):
+        await call.answer("Чек не найден.", show_alert=True)
+        return
+    if receipt["deleted"]:
+        await call.answer("Этот чек уже удалён.", show_alert=True)
+        return
+
+    await _send_own_receipt_card(call.message, receipt)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "my_del_back")
+async def my_receipts_delete_back(call: CallbackQuery):
+    await call.answer()
+    await _send_own_receipts_list(call.message, call.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("my_del_confirm:"))
+async def my_receipts_delete_confirm(call: CallbackQuery):
+    row = int(call.data.split(":", 1)[1])
+    receipt = google_sheets.get_receipt_by_row(row)
+    if not _owns_receipt(receipt, call.from_user.id):
+        await call.answer("Чек не найден.", show_alert=True)
+        return
+    if receipt["deleted"]:
+        await call.answer("Этот чек уже удалён.", show_alert=True)
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"my_del_yes:{row}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data=f"my_del_view:{row}"),
+    )
+    await call.message.answer(
+        "Точно удалить этот чек? Действие необратимо — чек больше не "
+        "будет учитываться при сверке с отчётом по продажам.",
+        reply_markup=kb.as_markup(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("my_del_yes:"))
+async def my_receipts_delete_do(call: CallbackQuery):
+    row = int(call.data.split(":", 1)[1])
+    receipt = google_sheets.get_receipt_by_row(row)
+    if not _owns_receipt(receipt, call.from_user.id):
+        await call.answer("Чек не найден.", show_alert=True)
+        return
+    if receipt["deleted"]:
+        await call.answer("Уже удалено.", show_alert=True)
+        return
+
+    try:
+        google_sheets.mark_receipt_deleted(row)
+    except Exception:
+        logger.exception("Не удалось удалить чек пользователя")
+        await call.answer("Не получилось удалить, попробуйте позже.", show_alert=True)
+        return
+
+    await call.answer("Чек удалён.")
+    await call.message.answer("Готово, чек удалён и больше не участвует в сверке.")
+    await _send_own_receipts_list(call.message, call.from_user.id)
+
+
 # ---------- Общая карточка чека (используется и в Истории, и в Модерации) ----------
 
 async def _send_receipt_card(
@@ -491,6 +671,7 @@ async def _send_receipt_card(
     receipt: dict,
     with_moderation_buttons: bool = False,
     with_history_buttons: bool = False,
+    viewer_id: int = None,
 ):
     reg = google_sheets.get_registration_by_telegram_id(receipt["telegram_id"])
 
@@ -522,9 +703,14 @@ async def _send_receipt_card(
 
     caption = "\n".join(lines)
 
-    reply_markup = None
-    if with_moderation_buttons:
-        kb = InlineKeyboardBuilder()
+    kb = InlineKeyboardBuilder()
+    has_buttons = False
+
+    # Кнопки модерации (Принять / Быстрое отклонение / Отклонить с
+    # комментарием) показываем и в самой Модерации, и в Истории — из
+    # Истории администратор тоже может сразу принять или отклонить чек,
+    # не переходя отдельно в "🛠 Модерация".
+    if with_moderation_buttons or with_history_buttons:
         kb.row(InlineKeyboardButton(text="✅ Принять", callback_data=f"mod_accept:{receipt['row']}"))
         kb.row(InlineKeyboardButton(
             text="⚡ Быстрое отклонение",
@@ -534,14 +720,23 @@ async def _send_receipt_card(
             text="💬 Отклонить с комментарием",
             callback_data=f"mod_reject_custom:{receipt['row']}",
         ))
-        reply_markup = kb.as_markup()
-    elif with_history_buttons:
-        kb = InlineKeyboardBuilder()
+        has_buttons = True
+
+    if with_history_buttons:
         kb.row(InlineKeyboardButton(text="🗑 Удалить чек", callback_data=f"hist_delete:{receipt['row']}"))
         date_str = receipt["date"][:10] if receipt.get("date") else ""
         if date_str:
             kb.row(InlineKeyboardButton(text="⬅️ Назад к списку", callback_data=f"cal_day:{date_str}"))
-        reply_markup = kb.as_markup()
+        has_buttons = True
+
+    if reg and viewer_id is not None and _is_owner(viewer_id):
+        kb.row(InlineKeyboardButton(
+            text="✏️ Исправить ИНН",
+            callback_data=f"fix_inn:{receipt['telegram_id']}",
+        ))
+        has_buttons = True
+
+    reply_markup = kb.as_markup() if has_buttons else None
 
     if receipt["file_id"]:
         try:
@@ -551,6 +746,63 @@ async def _send_receipt_card(
             logger.exception("Не удалось отправить фото чека администратору")
 
     await message.answer(caption, reply_markup=reply_markup)
+
+
+# ---------- Исправление ИНН пользователя (владелец, прямо с карточки чека) ----------
+
+@dp.callback_query(F.data.startswith("fix_inn:"), IsOwner())
+async def admin_fix_inn_start(call: CallbackQuery, state: FSMContext):
+    target_telegram_id = call.data.split(":", 1)[1]
+    await state.set_state(AdminForm.waiting_inn_fix)
+    await state.update_data(fix_inn_telegram_id=target_telegram_id)
+    await call.message.answer(
+        f"Введите новый ИНН магазина для пользователя с Telegram ID "
+        f"{target_telegram_id} (10 цифр для организации или 12 для ИП)."
+    )
+    await call.answer()
+
+
+@dp.message(StateFilter(AdminForm.waiting_inn_fix), F.text, IsOwner())
+async def admin_fix_inn_finish(message: Message, state: FSMContext):
+    new_inn = message.text.strip()
+
+    if not _INN_RE.match(new_inn):
+        await message.answer(
+            "ИНН должен состоять только из цифр — 10 цифр для организации "
+            "или 12 цифр для ИП. Введите ещё раз."
+        )
+        return
+
+    data = await state.get_data()
+    target_telegram_id = data.get("fix_inn_telegram_id")
+    await state.clear()
+
+    try:
+        updated = google_sheets.update_registration_inn(target_telegram_id, new_inn)
+    except Exception:
+        logger.exception("Не удалось обновить ИНН пользователя %s", target_telegram_id)
+        await message.answer(
+            "Не получилось обновить ИНН, попробуйте позже.",
+            reply_markup=_menu_for(message.from_user.id),
+        )
+        return
+
+    if not updated:
+        await message.answer(
+            "Не нашёл регистрацию с таким Telegram ID — возможно, она была удалена.",
+            reply_markup=_menu_for(message.from_user.id),
+        )
+        return
+
+    await message.answer(
+        f"Готово, ИНН обновлён на «{new_inn}».",
+        reply_markup=_menu_for(message.from_user.id),
+    )
+
+
+@dp.message(StateFilter(AdminForm.waiting_inn_fix), IsOwner())
+async def wrong_content_for_inn_fix(message: Message):
+    await message.answer("Пожалуйста, введите новый ИНН текстом (только цифры).")
 
 
 def _truncate(text: str, max_len: int) -> str:
@@ -674,7 +926,7 @@ async def admin_history_view(call: CallbackQuery):
     if not receipt:
         await call.answer("Не найдено", show_alert=True)
         return
-    await _send_receipt_card(call.message, receipt, with_history_buttons=True)
+    await _send_receipt_card(call.message, receipt, with_history_buttons=True, viewer_id=call.from_user.id)
     await call.answer()
 
 
@@ -768,39 +1020,54 @@ async def admin_moderation_view(call: CallbackQuery):
     if not receipt:
         await call.answer("Не найдено", show_alert=True)
         return
-    await _send_receipt_card(call.message, receipt, with_moderation_buttons=True)
+    await _send_receipt_card(call.message, receipt, with_moderation_buttons=True, viewer_id=call.from_user.id)
     await call.answer()
 
 
 async def _reject_receipt(row: int, reason_text: str):
     """Ставит чеку статус 'отклонён' и уведомляет пользователя причиной.
-    Возвращает (True, None) при успехе или (False, текст_ошибки)."""
+    Возвращает (True, notified, None) при успешном обновлении статуса
+    (notified — удалось ли отправить уведомление пользователю), или
+    (False, False, текст_ошибки), если не получилось даже обновить
+    статус."""
     receipt = google_sheets.get_receipt_by_row(row)
     if not receipt:
-        return False, "Не найдено."
+        return False, False, "Не найдено."
 
     try:
         google_sheets.update_receipt_status(row, google_sheets.STATUS_REJECTED, comment=reason_text)
     except Exception:
         logger.exception("Не удалось обновить статус чека")
-        return False, "Не получилось обновить таблицу, попробуйте ещё раз."
+        return False, False, "Не получилось обновить таблицу, попробуйте ещё раз."
 
+    notified = True
     try:
-        await bot.send_message(receipt["telegram_id"], reason_text)
+        await bot.send_message(int(receipt["telegram_id"]), reason_text)
     except Exception:
-        logger.exception("Не удалось уведомить пользователя об отклонении")
+        logger.exception(
+            "Не удалось уведомить пользователя %s об отклонении чека (строка %s)",
+            receipt["telegram_id"], row,
+        )
+        notified = False
 
-    return True, None
+    return True, notified, None
 
 
 @dp.callback_query(F.data.startswith("mod_reject_photo:"), IsModerator())
 async def admin_moderation_reject_photo(call: CallbackQuery):
     row = int(call.data.split(":", 1)[1])
-    ok, error = await _reject_receipt(row, google_sheets.get_text("reject_message"))
+    ok, notified, error = await _reject_receipt(row, google_sheets.get_text("reject_message"))
     if not ok:
         await call.answer(error, show_alert=True)
         return
-    await call.message.answer("Чек отклонён (быстрое отклонение), пользователь уведомлён.")
+    if notified:
+        await call.message.answer("Чек отклонён (быстрое отклонение), пользователь уведомлён.")
+    else:
+        await call.message.answer(
+            "Чек отклонён (быстрое отклонение), но отправить уведомление "
+            "пользователю не удалось (возможно, он заблокировал бота или "
+            "ни разу не запускал его)."
+        )
     await call.answer()
 
 
@@ -820,14 +1087,22 @@ async def admin_moderation_reject_custom_finish(message: Message, state: FSMCont
     data = await state.get_data()
     row = data.get("moderation_row")
 
-    ok, error = await _reject_receipt(row, message.text)
+    ok, notified, error = await _reject_receipt(row, message.text)
     await state.clear()
 
     menu = _menu_for(message.from_user.id)
     if not ok:
         await message.answer(error, reply_markup=menu)
         return
-    await message.answer("Чек отклонён, пользователь уведомлён.", reply_markup=menu)
+    if notified:
+        await message.answer("Чек отклонён, пользователь уведомлён.", reply_markup=menu)
+    else:
+        await message.answer(
+            "Чек отклонён, но отправить уведомление пользователю не "
+            "удалось (возможно, он заблокировал бота или ни разу не "
+            "запускал его).",
+            reply_markup=menu,
+        )
 
 
 @dp.callback_query(F.data.startswith("mod_accept:"), IsModerator())
@@ -867,10 +1142,10 @@ async def admin_moderation_accept_finish(message: Message, state: FSMContext):
             logger.exception("Не удалось подставить купон в шаблон сообщения, использую текст по умолчанию")
             accept_text = f"Ваш чек принят! Ваш купон Ozon: {coupon}"
 
-        await bot.send_message(receipt["telegram_id"], accept_text)
+        await bot.send_message(int(receipt["telegram_id"]), accept_text)
         await message.answer("Купон отправлен пользователю, статус обновлён.", reply_markup=_menu_for(message.from_user.id))
     except Exception:
-        logger.exception("Не удалось отправить купон пользователю")
+        logger.exception("Не удалось отправить купон пользователю %s (строка %s)", receipt["telegram_id"], row)
         await message.answer(
             "Статус обновлён, но отправить сообщение пользователю не удалось "
             "(возможно, он заблокировал бота).",
@@ -1028,8 +1303,9 @@ async def admin_import_menu(message: Message):
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="📦 Акционные позиции", callback_data="import_promo"))
     kb.row(InlineKeyboardButton(text="📈 Отчёт по продажам", callback_data="import_sales"))
+    kb.row(InlineKeyboardButton(text="🎟 Купоны", callback_data="import_coupons"))
     await message.answer(
-        "Что загружаем? Оба варианта — файл .xlsx, первая строка листа "
+        "Что загружаем? Все варианты — файл .xlsx, первая строка листа "
         "должна быть заголовком (её содержимое не важно, бот её "
         "пропускает и читает данные со 2-й строки).\n\n"
         "📦 Акционные позиции — колонки: Артикул, Наименование. "
@@ -1039,6 +1315,10 @@ async def admin_import_menu(message: Message):
         "ДОБАВЛЯЕТСЯ к уже имеющимся данным (ничего не заменяется), и "
         "каждая строка дополнительно помечается датой и временем именно "
         "этой загрузки.\n\n"
+        "🎟 Купоны — колонки: №, Username, купон, номинал. После загрузки "
+        "файла бот спросит подтверждение и разошлёт купоны пользователям "
+        "личным сообщением (по Username) — ничего не сохраняется в "
+        "Google Таблицу, это разовая рассылка.\n\n"
         "Если нужен пустой шаблон файла для заполнения — загляните в "
         f"«{ADMIN_BTN_TEMPLATES}».",
         reply_markup=kb.as_markup(),
@@ -1061,6 +1341,16 @@ async def admin_import_sales_start(call: CallbackQuery, state: FSMContext):
     await call.message.answer(
         "Пришлите файл .xlsx с отчётом по продажам (колонки: ИНН, "
         "Наименование, Артикул, Количество, Цена, № УПД, Дата продажи)."
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "import_coupons", IsOwner())
+async def admin_import_coupons_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminForm.waiting_coupons_file)
+    await call.message.answer(
+        "Пришлите файл .xlsx со списком купонов (колонки: №, Username, "
+        "купон, номинал)."
     )
     await call.answer()
 
@@ -1197,6 +1487,120 @@ async def wrong_content_for_sales_file(message: Message):
     await message.answer("Пожалуйста, пришлите файл .xlsx (документом).")
 
 
+@dp.message(StateFilter(AdminForm.waiting_coupons_file), F.document)
+async def admin_import_coupons_finish(message: Message, state: FSMContext):
+    if not message.document.file_name.lower().endswith((".xlsx", ".xlsm")):
+        await message.answer("Нужен файл в формате .xlsx. Пришлите файл ещё раз.")
+        return
+
+    try:
+        buf = await _download_document(message)
+        raw_rows = _read_xlsx_rows(buf, min_columns=4)
+    except Exception:
+        logger.exception("Не удалось прочитать файл с купонами")
+        await message.answer("Не получилось прочитать файл. Проверьте формат и попробуйте ещё раз.")
+        return
+
+    # row[0] — "№" (просто для удобства заполнения, боту не нужен).
+    coupon_rows = [
+        {"username": row[1].strip(), "coupon": row[2].strip(), "nominal": row[3].strip()}
+        for row in raw_rows
+        if row[1].strip() and row[2].strip()
+    ]
+
+    if not coupon_rows:
+        await state.clear()
+        await message.answer(
+            "В файле не нашлось ни одной строки с заполненными Username и "
+            "купоном. Проверьте файл и загрузите заново.",
+            reply_markup=owner_menu,
+        )
+        return
+
+    await state.set_state(AdminForm.coupons_confirm)
+    await state.update_data(coupon_rows=coupon_rows)
+
+    skipped = len(raw_rows) - len(coupon_rows)
+    skipped_note = f"\n(строк пропущено из-за пустых Username/купона: {skipped})" if skipped else ""
+
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="✅ Да", callback_data="coupons_send_yes"),
+        InlineKeyboardButton(text="❌ Нет", callback_data="coupons_send_no"),
+    )
+    await message.answer(
+        f"В файле {len(coupon_rows)} купон(ов) для рассылки.{skipped_note}\n\n"
+        "Отправить купоны пользователям?",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.message(StateFilter(AdminForm.waiting_coupons_file))
+async def wrong_content_for_coupons_file(message: Message):
+    await message.answer("Пожалуйста, пришлите файл .xlsx (документом).")
+
+
+@dp.callback_query(F.data == "coupons_send_yes", IsOwner(), StateFilter(AdminForm.coupons_confirm))
+async def admin_coupons_send_yes(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    coupon_rows = data.get("coupon_rows", [])
+    await state.clear()
+    await call.answer()
+    await call.message.answer("Рассылаю купоны, секунду...")
+
+    message_template = google_sheets.get_text("coupon_import_message")
+
+    sent = 0
+    not_found = []
+    failed = []
+
+    for row in coupon_rows:
+        username = row["username"]
+        telegram_id = google_sheets.get_telegram_id_by_username(username)
+        if not telegram_id:
+            not_found.append(username)
+            continue
+
+        try:
+            text = message_template.format(coupon=row["coupon"], nominal=row["nominal"])
+        except Exception:
+            text = f"Ваш купон для OZON: {row['coupon']}, с номиналом {row['nominal']}"
+
+        try:
+            await bot.send_message(int(telegram_id), text)
+            sent += 1
+        except Exception:
+            logger.exception("Не удалось отправить купон пользователю @%s", username)
+            failed.append(username)
+
+    summary = [f"Готово. Отправлено: {sent} из {len(coupon_rows)}."]
+    if not_found:
+        summary.append(
+            "Не найден Username (нет такой регистрации): " + ", ".join(f"@{u}" for u in not_found[:20])
+            + ("…" if len(not_found) > 20 else "")
+        )
+    if failed:
+        summary.append(
+            "Не удалось отправить сообщение (например, пользователь не "
+            "запускал бота): " + ", ".join(f"@{u}" for u in failed[:20])
+            + ("…" if len(failed) > 20 else "")
+        )
+
+    await call.message.answer("\n\n".join(summary), reply_markup=owner_menu)
+
+
+@dp.callback_query(F.data == "coupons_send_no", IsOwner(), StateFilter(AdminForm.coupons_confirm))
+async def admin_coupons_send_no(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.answer()
+    await call.message.answer("Хорошо, рассылка отменена.", reply_markup=owner_menu)
+
+
+@dp.callback_query(F.data.in_({"coupons_send_yes", "coupons_send_no"}))
+async def admin_coupons_send_stale(call: CallbackQuery):
+    await call.answer("Эта кнопка уже не активна.", show_alert=True)
+
+
 # ---------- Шаблоны для импорта ----------
 
 TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
@@ -1214,6 +1618,11 @@ TEMPLATE_FILES = {
         "Шаблон для импорта отчёта по продажам. Колонки: ИНН, "
         "Наименование, Артикул, Количество, Цена, № УПД, Дата продажи.",
     ),
+    "template_coupons": (
+        "coupons_template.xlsx",
+        "Шаблон для рассылки купонов. Колонки: №, Username, купон, "
+        "номинал.",
+    ),
 }
 
 
@@ -1222,6 +1631,7 @@ async def admin_templates_menu(message: Message):
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="📦 Акционные позиции", callback_data="template_promo"))
     kb.row(InlineKeyboardButton(text="📈 Отчёт по продажам", callback_data="template_sales"))
+    kb.row(InlineKeyboardButton(text="🎟 Купоны", callback_data="template_coupons"))
     await message.answer("Какой шаблон для импорта прислать?", reply_markup=kb.as_markup())
 
 
@@ -1312,6 +1722,7 @@ async def admin_reports_menu(message: Message):
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="📄 Общий отчёт", callback_data="report_general"))
     kb.row(InlineKeyboardButton(text="🔎 Отчёт по продажам", callback_data="report_sales_match"))
+    kb.row(InlineKeyboardButton(text="👤 Отчёт по пользователям", callback_data="report_by_users"))
     await message.answer("Какой отчёт сформировать?", reply_markup=kb.as_markup())
 
 
@@ -1381,6 +1792,25 @@ async def admin_report_sales_match_start(call: CallbackQuery, state: FSMContext)
         "продажам: совпадением считается одинаковые ИНН + № УПД + дата "
         "продажи, и хотя бы один товар по этому УПД — из списка акционных "
         "позиций.",
+        reply_markup=_build_calendar(today.year, today.month, prefix="pstart"),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "report_by_users", IsModerator())
+async def admin_report_by_users_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminForm.picking_period)
+    await state.update_data(period_purpose="user_report")
+    today = google_sheets.moscow_today()
+    await call.message.answer(
+        "Отчёт по пользователям.\n\n"
+        "Выберите дату НАЧАЛА периода в календаре ниже (по дате чека). "
+        "Бот соберёт все чеки пользователей за этот период, сверит их с "
+        "отчётом по продажам (по ИНН + № УПД + дате чека) и пришлёт "
+        "сводку проданных позиций по каждому пользователю: ФИО, "
+        "username, ИНН, магазин, артикул, наименование, количество и "
+        "сумма (без фильтра по акционным позициям — тут собираются все "
+        "найденные позиции).",
         reply_markup=_build_calendar(today.year, today.month, prefix="pstart"),
     )
     await call.answer()
@@ -1539,6 +1969,107 @@ def _build_sales_match_workbook(start_date: date, end_date: date):
     return buf, len(matched), len(unmatched), matched_rows
 
 
+def _parse_number_loose(text):
+    """Разбирает число (количество/цена) из текста — на случай, если в
+    ячейке была запятая вместо точки как десятичный разделитель.
+    Возвращает float или None, если не получилось."""
+    if text is None:
+        return None
+    text = str(text).strip().replace(",", ".").replace(" ", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _build_user_report_workbook(start_date: date, end_date: date):
+    """«Отчёт по пользователям»: за период собирает все чеки пользователей
+    (ИНН + № УПД + дата чека), сверяет их с отчётом по продажам (как и
+    "🔎 Отчёт по продажам", но БЕЗ фильтра по акционным позициям — тут
+    собираются вообще все проданные позиции по каждому найденному
+    совпадению), и группирует результат по пользователю + артикулу +
+    цене, суммируя количество (и, соответственно, сумму = кол-во × цена).
+    Возвращает (буфер с Excel, число строк в сводке)."""
+    sales_index = {}
+    for s in google_sheets.get_sales_report():
+        sale_date = _parse_date_loose(s["sale_date"])
+        if not sale_date:
+            continue
+        key = (s["inn"].strip(), s["upd_number"].strip(), sale_date)
+        sales_index.setdefault(key, []).append(s)
+
+    # (telegram_id, артикул, цена) -> накопленные данные по позиции
+    groups = {}
+
+    for r in google_sheets.get_receipts():
+        if r["deleted"] or not r["upd_number"] or not r["receipt_date"]:
+            continue
+
+        receipt_date = _parse_date_loose(r["receipt_date"])
+        if not receipt_date or not (start_date <= receipt_date <= end_date):
+            continue
+
+        reg = google_sheets.get_registration_by_telegram_id(r["telegram_id"])
+        inn = (reg.get("inn") or "").strip() if reg else ""
+        if not inn:
+            continue
+
+        sale_lines = sales_index.get((inn, r["upd_number"].strip(), receipt_date), [])
+
+        for s in sale_lines:
+            article = s["article"].strip()
+            if not article:
+                continue
+
+            quantity = _parse_number_loose(s["quantity"])
+            price = _parse_number_loose(s["price"])
+            if quantity is None or price is None:
+                continue
+
+            group_key = (r["telegram_id"], article, price)
+            group = groups.get(group_key)
+            if group is None:
+                group = {
+                    "full_name": reg["full_name"] if reg else "",
+                    "username": r["username"],
+                    "inn": inn,
+                    "shop": reg["shop"] if reg else "",
+                    "article": article,
+                    "name": s["name"],
+                    "price": price,
+                    "quantity": 0.0,
+                }
+                groups[group_key] = group
+            group["quantity"] += quantity
+
+    rows = sorted(groups.values(), key=lambda g: (g["full_name"], g["article"]))
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Отчёт по пользователям"
+    headers = [
+        "№", "ФИО", "Username", "ИНН", "Магазин", "Артикул",
+        "Наименование позиции", "Шт", "Цена", "Сумма",
+    ]
+    ws.append(headers)
+    for i, g in enumerate(rows, start=1):
+        quantity = g["quantity"]
+        quantity_display = int(quantity) if quantity == int(quantity) else quantity
+        amount = quantity * g["price"]
+        ws.append([
+            i, g["full_name"], g["username"], g["inn"], g["shop"],
+            g["article"], g["name"], quantity_display, g["price"], amount,
+        ])
+    _autosize(ws, headers)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf, len(rows)
+
+
 # ---------- Автоматическая модерация (та же сверка + смена статуса) ----------
 
 @dp.callback_query(F.data == "moderation_auto", IsModerator())
@@ -1653,10 +2184,29 @@ async def _run_period_matching(
     end_date: date,
     user_id: int,
 ):
-    """Общая логика сверки для «📊 Отчёты -> Отчёт по продажам» и
-    «🛠 Модерация -> Автоматическая модерация»: строит Excel сверки и
-    либо просто присылает его (purpose == "sales_match"), либо
-    дополнительно предлагает сразу сменить статусы (purpose == "auto_mod")."""
+    """Общая логика для трёх пунктов, использующих выбор периода двумя
+    календарями: «📊 Отчёты -> Отчёт по продажам», «📊 Отчёты -> Отчёт по
+    пользователям» и «🛠 Модерация -> Автоматическая модерация»."""
+    filename_suffix = f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
+
+    if purpose == "user_report":
+        try:
+            buf, rows_count = _build_user_report_workbook(start_date, end_date)
+        except Exception:
+            logger.exception("Не удалось сформировать отчёт по пользователям")
+            await message.answer("Не получилось сформировать отчёт, попробуйте позже.")
+            await state.clear()
+            return
+
+        await state.clear()
+        filename = f"otchet_polzovateli_{filename_suffix}.xlsx"
+        await message.answer_document(
+            BufferedInputFile(buf.read(), filename=filename),
+            caption=f"Строк в сводке: {rows_count}.",
+            reply_markup=_menu_for(user_id),
+        )
+        return
+
     try:
         buf, matched_count, unmatched_count, matched_rows = _build_sales_match_workbook(start_date, end_date)
     except Exception:
@@ -1664,8 +2214,6 @@ async def _run_period_matching(
         await message.answer("Не получилось выполнить сверку, попробуйте позже.")
         await state.clear()
         return
-
-    filename_suffix = f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
 
     if purpose == "auto_mod":
         filename = f"avto_moderatsiya_{filename_suffix}.xlsx"

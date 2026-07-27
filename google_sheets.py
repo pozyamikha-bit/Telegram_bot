@@ -73,6 +73,7 @@ DEFAULT_TEXTS = {
     "receipt_received": "Спасибо! Чек принят на модерацию. Ожидайте купон Ozon.",
     "reject_message": "Плохое качество фото чека, просьба повторно зарегистрировать чек",
     "accept_message": "Ваш чек принят! Ваш купон Ozon: {coupon}",
+    "coupon_import_message": "Ваш купон для OZON: {coupon}, с номиналом {nominal}",
 }
 
 # Подписи для меню редактирования текстов в админ-панели.
@@ -85,6 +86,11 @@ TEXT_LABELS = {
     "receipt_received": "Ответ сразу после получения чека",
     "reject_message": "Сообщение при отклонении кнопкой «Быстрое отклонение»",
     "accept_message": "Сообщение при принятии чека (внутри можно оставить {coupon} — вместо него подставится номер купона)",
+    "coupon_import_message": (
+        "Сообщение при рассылке купонов через «📥 Импорт → 🎟 Купоны» "
+        "(можно оставить {coupon} и {nominal} — вместо них подставятся "
+        "номер купона и номинал из файла)"
+    ),
 }
 
 # Московское время: фиксированное смещение UTC+3 (в России нет перехода
@@ -284,6 +290,29 @@ def get_all_registrations():
     return result
 
 
+def update_registration_inn(telegram_id, new_inn: str) -> bool:
+    """Обновляет ИНН магазина в последней (самой новой) строке
+    регистрации с данным Telegram ID. Возвращает True, если такая
+    регистрация нашлась и была обновлена, False — если нет."""
+    records = _get_records(config.GOOGLE_SHEET_WORKSHEET_REG, header=REGISTRATION_HEADER)
+    telegram_id = str(telegram_id)
+
+    target_row = None
+    for i in range(len(records) - 1, -1, -1):
+        if str(records[i].get("Telegram ID", "")) == telegram_id:
+            target_row = i + 2  # +2: строка 1 — заголовок, записи нумеруются с 0
+            break
+
+    if target_row is None:
+        return False
+
+    ws = _get_worksheet(config.GOOGLE_SHEET_WORKSHEET_REG, header=REGISTRATION_HEADER)
+    inn_col = REGISTRATION_HEADER.index("ИНН магазина") + 1
+    ws.update_cell(target_row, inn_col, new_inn)
+    _invalidate_records_cache(config.GOOGLE_SHEET_WORKSHEET_REG)
+    return True
+
+
 def get_registration_by_telegram_id(telegram_id):
     """Возвращает последнюю регистрацию пользователя с данным Telegram ID
     в виде {"full_name", "shop", "phone", "inn"} или None, если не найдено."""
@@ -297,6 +326,24 @@ def get_registration_by_telegram_id(telegram_id):
                 "phone": str(rec.get("Телефон", "")),
                 "inn": str(rec.get("ИНН магазина", "")),
             }
+    return None
+
+
+def get_telegram_id_by_username(username: str):
+    """Ищет Telegram ID последнего зарегистрированного пользователя с
+    таким Username (без учёта регистра и необязательного "@" в начале
+    строки). Используется при рассылке купонов из "📥 Импорт → 🎟
+    Купоны", где пользователи указаны по Username, а писать в Telegram
+    можно только по Telegram ID. Возвращает Telegram ID (str) или None,
+    если такой Username не встречается ни в одной регистрации."""
+    username = (username or "").strip().lstrip("@").lower()
+    if not username:
+        return None
+    records = _get_records(config.GOOGLE_SHEET_WORKSHEET_REG, header=REGISTRATION_HEADER)
+    for rec in reversed(records):
+        rec_username = str(rec.get("Username", "")).strip().lstrip("@").lower()
+        if rec_username and rec_username == username:
+            return str(rec.get("Telegram ID", ""))
     return None
 
 
@@ -321,6 +368,26 @@ def get_receipts():
             "receipt_date": str(rec.get("Дата чека", "")),
         })
     return result
+
+
+def find_active_receipt_by_upd(upd_number: str):
+    """Ищет уже существующий чек с таким же № УПД, который всё ещё
+    "активен" — не удалён и не отклонён модератором. Используется, чтобы
+    не дать подать один и тот же № УПД дважды (в том числе двум разным
+    пользователям) — по правилам один чек даёт только один купон.
+    Отклонённые чеки НЕ считаются занятыми — пользователю разрешено
+    повторно подать чек с тем же № УПД, если модератор его отклонил
+    (например, из-за плохого фото). Возвращает словарь чека (в формате
+    get_receipts()) или None, если совпадений не нашлось."""
+    upd_number = (upd_number or "").strip()
+    if not upd_number:
+        return None
+    for r in get_receipts():
+        if r["deleted"] or r["status"] == STATUS_REJECTED:
+            continue
+        if r["upd_number"].strip() == upd_number:
+            return r
+    return None
 
 
 def get_receipts_by_date(date_str: str, include_deleted: bool = False):
