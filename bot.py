@@ -159,6 +159,25 @@ def _menu_for(user_id: int):
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+
+    try:
+        existing = google_sheets.get_registration_by_telegram_id(message.from_user.id)
+    except Exception:
+        logger.exception("Не удалось проверить регистрацию пользователя при /start")
+        existing = None
+
+    if existing:
+        full_name = (existing.get("full_name") or "").strip()
+        greeting = f"С возвращением, {full_name}!" if full_name else "С возвращением!"
+        await message.answer(
+            f"{greeting} Вы уже зарегистрированы, повторно проходить "
+            "регистрацию не нужно.\n\n"
+            "Можно отправить новый чек / УПД или посмотреть чеки, "
+            "загруженные ранее.",
+            reply_markup=main_menu,
+        )
+        return
+
     await state.set_state(Form.name)
     await message.answer(
         "Здравствуйте! Давайте зарегистрируем вас в программе.\n\n"
@@ -274,10 +293,27 @@ async def show_rules(message: Message):
 
 # ---------- Приём чеков ----------
 
+RECEIPT_CANCEL_CALLBACK = "receipt_cancel"
+
+
+def _cancel_kb(text: str = "❌ Отмена"):
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text=text, callback_data=RECEIPT_CANCEL_CALLBACK))
+    return kb.as_markup()
+
+
+def _calendar_with_cancel(year: int, month: int, prefix: str = "rcal"):
+    markup = _build_calendar(year, month, prefix=prefix)
+    markup.inline_keyboard.append(
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=RECEIPT_CANCEL_CALLBACK)]
+    )
+    return markup
+
+
 @dp.message(F.text == BTN_SEND_RECEIPT)
 async def send_receipt_start(message: Message, state: FSMContext):
     await state.set_state(Form.waiting_photo)
-    await message.answer(google_sheets.get_text("ask_photo"))
+    await message.answer(google_sheets.get_text("ask_photo"), reply_markup=_cancel_kb())
 
 
 @dp.message(StateFilter(Form.waiting_photo), F.photo)
@@ -299,12 +335,15 @@ async def process_photo(message: Message, state: FSMContext):
     # одной строкой.
     await state.update_data(photo_file_id=file_id, photo_file_name=filepath)
     await state.set_state(Form.waiting_upd_number)
-    await message.answer(google_sheets.get_text("ask_upd_number"))
+    await message.answer(google_sheets.get_text("ask_upd_number"), reply_markup=_cancel_kb())
 
 
 @dp.message(StateFilter(Form.waiting_photo))
 async def wrong_content_for_photo(message: Message):
-    await message.answer("Пожалуйста, пришлите именно фото (как изображение, не файлом).")
+    await message.answer(
+        "Пожалуйста, пришлите именно фото (как изображение, не файлом).",
+        reply_markup=_cancel_kb(),
+    )
 
 
 @dp.message(StateFilter(Form.waiting_upd_number), F.text)
@@ -314,13 +353,41 @@ async def process_upd_number(message: Message, state: FSMContext):
     today = google_sheets.moscow_today()
     await message.answer(
         google_sheets.get_text("ask_receipt_date"),
-        reply_markup=_build_calendar(today.year, today.month, prefix="rcal"),
+        reply_markup=_calendar_with_cancel(today.year, today.month, prefix="rcal"),
     )
 
 
 @dp.message(StateFilter(Form.waiting_upd_number))
 async def wrong_content_for_upd_number(message: Message):
-    await message.answer("Пожалуйста, введите номер УПД текстом (одним сообщением).")
+    await message.answer(
+        "Пожалуйста, введите номер УПД текстом (одним сообщением).",
+        reply_markup=_cancel_kb(),
+    )
+
+
+@dp.callback_query(F.data == RECEIPT_CANCEL_CALLBACK)
+async def receipt_cancel(call: CallbackQuery, state: FSMContext):
+    current_state = await state.get_state()
+    active_states = {
+        Form.waiting_photo.state,
+        Form.waiting_upd_number.state,
+        Form.waiting_receipt_date.state,
+    }
+    if current_state not in active_states:
+        await call.answer("Загрузка чека уже завершена или отменена.", show_alert=True)
+        return
+
+    await state.clear()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await call.answer("Отменено.")
+    await call.message.answer(
+        "Загрузка чека отменена. Можно отправить чек заново или "
+        "посмотреть уже загруженные чеки.",
+        reply_markup=main_menu,
+    )
 
 
 @dp.callback_query(F.data == "rcal_ignore")
@@ -332,7 +399,7 @@ async def receipt_calendar_ignore(call: CallbackQuery):
 async def receipt_calendar_nav(call: CallbackQuery):
     _, ym = call.data.split(":", 1)
     year, month = map(int, ym.split("-"))
-    await call.message.edit_reply_markup(reply_markup=_build_calendar(year, month, prefix="rcal"))
+    await call.message.edit_reply_markup(reply_markup=_calendar_with_cancel(year, month, prefix="rcal"))
     await call.answer()
 
 
@@ -1352,14 +1419,42 @@ def _build_sales_match_workbook(start_date: date, end_date: date):
     unmatched = []
 
     for r in google_sheets.get_receipts():
-        if r["deleted"] or not r["upd_number"] or not r["receipt_date"]:
+        # Сверяем ВСЕ чеки за период — независимо от статуса модерации
+        # (на модерации / принят / отклонён): единственное исключение —
+        # помеченные удалёнными.
+        if r["deleted"]:
             continue
 
-        receipt_date = _parse_date_loose(r["receipt_date"])
-        if not receipt_date or not (start_date <= receipt_date <= end_date):
+        receipt_date = _parse_date_loose(r["receipt_date"]) if r["receipt_date"] else None
+        # Если дата чека не указана (например, старые чеки, загруженные
+        # ещё до того, как это поле стало обязательным), для определения
+        # попадания в период используем дату ЗАГРУЗКИ чека — чтобы такие
+        # чеки не выпадали из выборки молча, а попали в "Без совпадений"
+        # с понятной причиной.
+        upload_date = _parse_date_loose(r["date"]) if r["date"] else None
+        period_ref_date = receipt_date or upload_date
+
+        if not period_ref_date or not (start_date <= period_ref_date <= end_date):
             continue
 
         reg = google_sheets.get_registration_by_telegram_id(r["telegram_id"])
+
+        if not r["upd_number"] or not receipt_date:
+            missing = []
+            if not r["upd_number"]:
+                missing.append("№ УПД")
+            if not receipt_date:
+                missing.append("дата чека")
+            detail = ""
+            if not receipt_date and upload_date:
+                detail = "Попал в период по дате загрузки чека, т.к. дата чека не указана."
+            unmatched.append((
+                r, reg,
+                f"у чека не заполнено: {', '.join(missing)} — сверить с отчётом по продажам нельзя",
+                detail,
+            ))
+            continue
+
         inn = (reg.get("inn") or "").strip() if reg else ""
         upd_number = r["upd_number"].strip()
 
@@ -1409,27 +1504,29 @@ def _build_sales_match_workbook(start_date: date, end_date: date):
     ws_matched = wb.active
     ws_matched.title = "Совпадения"
     matched_headers = [
-        "Дата чека", "№ УПД", "Telegram ID", "Username", "ФИО", "Магазин", "ИНН магазина",
+        "Дата чека", "№ УПД", "Telegram ID", "Username", "ФИО", "Магазин", "ИНН магазина", "Статус чека",
         "Артикул", "Наименование товара", "Количество", "Цена",
     ]
     ws_matched.append(matched_headers)
     for r, reg, s in matched:
         ws_matched.append([
             r["receipt_date"], r["upd_number"], r["telegram_id"], r["username"],
-            reg["full_name"] if reg else "", reg["shop"] if reg else "", reg["inn"] if reg else "",
+            reg["full_name"] if reg else "", reg["shop"] if reg else "", reg["inn"] if reg else "", r["status"],
             s["article"], s["name"], s["quantity"], s["price"],
         ])
     _autosize(ws_matched, matched_headers)
 
     ws_unmatched = wb.create_sheet("Без совпадений")
     unmatched_headers = [
-        "Дата чека", "№ УПД", "Telegram ID", "Username", "ФИО", "Магазин", "ИНН магазина", "Причина", "Подробности",
+        "Дата чека", "№ УПД", "Telegram ID", "Username", "ФИО", "Магазин", "ИНН магазина", "Статус чека",
+        "Причина", "Подробности",
     ]
     ws_unmatched.append(unmatched_headers)
     for r, reg, reason, detail in unmatched:
         ws_unmatched.append([
             r["receipt_date"], r["upd_number"], r["telegram_id"], r["username"],
-            reg["full_name"] if reg else "", reg["shop"] if reg else "", reg["inn"] if reg else "", reason, detail,
+            reg["full_name"] if reg else "", reg["shop"] if reg else "", reg["inn"] if reg else "", r["status"],
+            reason, detail,
         ])
     _autosize(ws_unmatched, unmatched_headers)
     ws_unmatched.column_dimensions[get_column_letter(len(unmatched_headers))].width = 70
