@@ -1926,8 +1926,8 @@ async def admin_report_by_users_start(call: CallbackQuery, state: FSMContext):
         "отчётом по продажам (по ИНН + № УПД + дате чека) и пришлёт "
         "сводку проданных позиций по каждому пользователю: ФИО, "
         "username, ИНН, магазин, артикул, наименование, количество и "
-        "сумма (без фильтра по акционным позициям — тут собираются все "
-        "найденные позиции).",
+        "сумма (только по позициям из списка акционных товаров — как и "
+        "в «🔎 Отчёт по продажам»).",
         reply_markup=_build_calendar(today.year, today.month, prefix="pstart"),
     )
     await call.answer()
@@ -2103,12 +2103,16 @@ def _parse_number_loose(text):
 
 def _build_user_report_workbook(start_date: date, end_date: date):
     """«Отчёт по пользователям»: за период собирает все чеки пользователей
-    (ИНН + № УПД + дата чека), сверяет их с отчётом по продажам (как и
-    "🔎 Отчёт по продажам", но БЕЗ фильтра по акционным позициям — тут
-    собираются вообще все проданные позиции по каждому найденному
-    совпадению), и группирует результат по пользователю + артикулу +
-    цене, суммируя количество (и, соответственно, сумму = кол-во × цена).
-    Возвращает (буфер с Excel, число строк в сводке)."""
+    (ИНН + № УПД + дата чека), сверяет их с отчётом по продажам — как и
+    "🔎 Отчёт по продажам", учитываются только позиции из списка
+    акционных товаров ("📦 Акционные позиции" через "📥 Импорт") — и
+    группирует результат по пользователю + артикулу + цене, суммируя
+    количество (и, соответственно, сумму = кол-во × цена). Возвращает
+    (буфер с Excel, число строк в сводке)."""
+    promo_articles = {
+        item["article"].strip() for item in google_sheets.get_promo_items() if item["article"].strip()
+    }
+
     sales_index = {}
     for s in google_sheets.get_sales_report():
         sale_date = _parse_date_loose(s["sale_date"])
@@ -2134,8 +2138,9 @@ def _build_user_report_workbook(start_date: date, end_date: date):
             continue
 
         sale_lines = sales_index.get((inn, google_sheets.normalize_upd(r["upd_number"]), receipt_date), [])
+        promo_lines = [s for s in sale_lines if s["article"].strip() in promo_articles]
 
-        for s in sale_lines:
+        for s in promo_lines:
             article = s["article"].strip()
             if not article:
                 continue
