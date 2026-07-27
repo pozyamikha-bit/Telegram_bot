@@ -1348,12 +1348,16 @@ async def admin_moderator_delete(call: CallbackQuery):
 
 # ---------- Редактирование текстов-автоответов (только владельцы) ----------
 
-@dp.message(F.text == ADMIN_BTN_TEXTS, IsOwner())
-async def admin_texts_menu(message: Message):
+def _texts_menu_markup():
     builder = InlineKeyboardBuilder()
     for key, label in google_sheets.TEXT_LABELS.items():
         builder.row(InlineKeyboardButton(text=label, callback_data=f"text_edit:{key}"))
-    await message.answer("Какой текст изменить?", reply_markup=builder.as_markup())
+    return builder.as_markup()
+
+
+@dp.message(F.text == ADMIN_BTN_TEXTS, IsOwner())
+async def admin_texts_menu(message: Message):
+    await message.answer("Какой текст изменить?", reply_markup=_texts_menu_markup())
 
 
 @dp.callback_query(F.data.startswith("text_edit:"), IsOwner())
@@ -1371,10 +1375,26 @@ async def admin_text_edit_start(call: CallbackQuery, state: FSMContext):
 
     await state.set_state(AdminForm.waiting_text_value)
     await state.update_data(text_key=key)
+
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="❌ Отмена", callback_data="text_edit_cancel"))
     await call.message.answer(
-        f"«{label}»\n\nТекущий текст:\n{current}\n\nПришлите новый текст одним сообщением."
+        f"«{label}»\n\nТекущий текст:\n{current}\n\nПришлите новый текст одним сообщением.",
+        reply_markup=kb.as_markup(),
     )
     await call.answer()
+
+
+@dp.callback_query(F.data == "text_edit_cancel", IsOwner(), StateFilter(AdminForm.waiting_text_value))
+async def admin_text_edit_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.answer()
+    await call.message.answer("Изменение текста отменено.", reply_markup=_texts_menu_markup())
+
+
+@dp.callback_query(F.data == "text_edit_cancel")
+async def admin_text_edit_cancel_stale(call: CallbackQuery):
+    await call.answer("Эта кнопка уже не активна.", show_alert=True)
 
 
 @dp.message(StateFilter(AdminForm.waiting_text_value), IsOwner())
