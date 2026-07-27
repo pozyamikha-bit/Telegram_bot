@@ -71,6 +71,7 @@ class Form(StatesGroup):
 
 
 class AdminForm(StatesGroup):
+    accept_coupon_choice = State()
     waiting_coupon = State()
     waiting_moderator_id = State()
     waiting_text_value = State()
@@ -124,6 +125,7 @@ ADMIN_BTN_REPORT = "📊 Отчёты"
 ADMIN_BTN_TEXTS = "✏️ Тексты"
 ADMIN_BTN_IMPORT = "📥 Импорт"
 ADMIN_BTN_TEMPLATES = "🗂 Шаблоны"
+ADMIN_BTN_INSTRUCTIONS = "📖 Инструкция"
 ADMIN_BTN_EXIT = "⬅️ Выйти из панели"
 
 _main_menu_builder = ReplyKeyboardBuilder()
@@ -138,8 +140,9 @@ _moderator_menu_builder = ReplyKeyboardBuilder()
 _moderator_menu_builder.button(text=ADMIN_BTN_HISTORY)
 _moderator_menu_builder.button(text=ADMIN_BTN_MODERATION)
 _moderator_menu_builder.button(text=ADMIN_BTN_REPORT)
+_moderator_menu_builder.button(text=ADMIN_BTN_INSTRUCTIONS)
 _moderator_menu_builder.button(text=ADMIN_BTN_EXIT)
-_moderator_menu_builder.adjust(2, 2)
+_moderator_menu_builder.adjust(2, 2, 1)
 moderator_menu = _moderator_menu_builder.as_markup(resize_keyboard=True)
 
 _owner_menu_builder = ReplyKeyboardBuilder()
@@ -150,8 +153,9 @@ _owner_menu_builder.button(text=ADMIN_BTN_MODERATORS)
 _owner_menu_builder.button(text=ADMIN_BTN_TEXTS)
 _owner_menu_builder.button(text=ADMIN_BTN_IMPORT)
 _owner_menu_builder.button(text=ADMIN_BTN_TEMPLATES)
+_owner_menu_builder.button(text=ADMIN_BTN_INSTRUCTIONS)
 _owner_menu_builder.button(text=ADMIN_BTN_EXIT)
-_owner_menu_builder.adjust(2, 2, 2, 2)
+_owner_menu_builder.adjust(2, 2, 2, 2, 1)
 owner_menu = _owner_menu_builder.as_markup(resize_keyboard=True)
 
 
@@ -205,6 +209,16 @@ async def cmd_admin(message: Message, state: FSMContext):
 async def admin_exit(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Вышли из панели.", reply_markup=main_menu)
+
+
+@dp.message(F.text == ADMIN_BTN_INSTRUCTIONS, IsModerator())
+async def admin_instructions(message: Message):
+    # Два отдельных сообщения: инструкция по самой админ-панели и
+    # инструкция по тому, как пользователь отправляет чек. Тексты
+    # редактируются владельцем через "✏️ Тексты" (ключи instructions_admin
+    # и instructions_receipt), поэтому их можно менять без изменения кода.
+    await message.answer(google_sheets.get_text("instructions_admin"))
+    await message.answer(google_sheets.get_text("instructions_receipt"))
 
 
 # ---------- Регистрация (продолжение сценария) ----------
@@ -540,8 +554,18 @@ async def _send_own_receipts_list(message: Message, user_id: int):
         await message.answer("Не получилось получить список чеков, попробуйте позже.")
         return
 
+    # Удалять самому можно только чеки, которые ещё НЕ прошли модерацию
+    # (статус "на модерации") — принятые/отклонённые чеки менять задним
+    # числом пользователю нельзя (по ним уже могли отправить купон или
+    # отказ, это должно остаться в таблице).
+    receipts = [r for r in receipts if r["status"] == google_sheets.STATUS_PENDING]
+
     if not receipts:
-        await message.answer("У вас нет загруженных чеков, которые можно удалить.")
+        await message.answer(
+            "У вас нет чеков, которые можно удалить — удалить можно "
+            "только чеки со статусом «на модерации» (уже "
+            "промодерированные принятые/отклонённые чеки удалить нельзя)."
+        )
         return
 
     kb = InlineKeyboardBuilder()
@@ -596,6 +620,12 @@ def _owns_receipt(receipt: dict, user_id: int) -> bool:
     return bool(receipt) and receipt["telegram_id"] == str(user_id)
 
 
+def _user_can_delete_receipt(receipt: dict) -> bool:
+    """Пользователь может удалить только свой ещё не промодерированный
+    чек (статус "на модерации") — принятые/отклонённые уже нельзя."""
+    return bool(receipt) and not receipt["deleted"] and receipt["status"] == google_sheets.STATUS_PENDING
+
+
 @dp.callback_query(F.data.startswith("my_del_view:"))
 async def my_receipts_delete_view(call: CallbackQuery):
     row = int(call.data.split(":", 1)[1])
@@ -605,6 +635,12 @@ async def my_receipts_delete_view(call: CallbackQuery):
         return
     if receipt["deleted"]:
         await call.answer("Этот чек уже удалён.", show_alert=True)
+        return
+    if not _user_can_delete_receipt(receipt):
+        await call.answer(
+            "Этот чек уже прошёл модерацию — удалить его самостоятельно нельзя.",
+            show_alert=True,
+        )
         return
 
     await _send_own_receipt_card(call.message, receipt)
@@ -624,8 +660,11 @@ async def my_receipts_delete_confirm(call: CallbackQuery):
     if not _owns_receipt(receipt, call.from_user.id):
         await call.answer("Чек не найден.", show_alert=True)
         return
-    if receipt["deleted"]:
-        await call.answer("Этот чек уже удалён.", show_alert=True)
+    if not _user_can_delete_receipt(receipt):
+        await call.answer(
+            "Этот чек уже нельзя удалить (уже удалён или прошёл модерацию).",
+            show_alert=True,
+        )
         return
 
     kb = InlineKeyboardBuilder()
@@ -648,8 +687,11 @@ async def my_receipts_delete_do(call: CallbackQuery):
     if not _owns_receipt(receipt, call.from_user.id):
         await call.answer("Чек не найден.", show_alert=True)
         return
-    if receipt["deleted"]:
-        await call.answer("Уже удалено.", show_alert=True)
+    if not _user_can_delete_receipt(receipt):
+        await call.answer(
+            "Этот чек уже нельзя удалить (уже удалён или прошёл модерацию).",
+            show_alert=True,
+        )
         return
 
     try:
@@ -1108,10 +1150,60 @@ async def admin_moderation_reject_custom_finish(message: Message, state: FSMCont
 @dp.callback_query(F.data.startswith("mod_accept:"), IsModerator())
 async def admin_moderation_accept_start(call: CallbackQuery, state: FSMContext):
     row = int(call.data.split(":", 1)[1])
-    await state.set_state(AdminForm.waiting_coupon)
+    await state.set_state(AdminForm.accept_coupon_choice)
     await state.update_data(moderation_row=row)
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="✅ Да", callback_data="accept_coupon_yes"),
+        InlineKeyboardButton(text="❌ Нет", callback_data="accept_coupon_no"),
+    )
+    await call.message.answer("Чек принимается. Отправить купон?", reply_markup=kb.as_markup())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "accept_coupon_yes", IsModerator(), StateFilter(AdminForm.accept_coupon_choice))
+async def admin_accept_coupon_yes(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminForm.waiting_coupon)
     await call.message.answer("Введите номер купона одним сообщением — я отправлю его пользователю.")
     await call.answer()
+
+
+@dp.callback_query(F.data == "accept_coupon_no", IsModerator(), StateFilter(AdminForm.accept_coupon_choice))
+async def admin_accept_coupon_no(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    row = data.get("moderation_row")
+    await state.clear()
+    await call.answer()
+
+    receipt = google_sheets.get_receipt_by_row(row)
+    if not receipt:
+        await call.message.answer("Не удалось найти этот чек (возможно, таблица изменилась).")
+        return
+
+    try:
+        google_sheets.update_receipt_status(row, google_sheets.STATUS_ACCEPTED)
+    except Exception:
+        logger.exception("Не удалось обновить статус чека")
+        await call.message.answer("Не получилось обновить таблицу, попробуйте ещё раз.")
+        return
+
+    menu = _menu_for(call.from_user.id)
+    try:
+        text = google_sheets.get_text("accept_no_coupon_message")
+        await bot.send_message(int(receipt["telegram_id"]), text)
+        await call.message.answer("Чек принят без купона, пользователь уведомлён.", reply_markup=menu)
+    except Exception:
+        logger.exception("Не удалось уведомить пользователя %s о принятии чека без купона (строка %s)", receipt["telegram_id"], row)
+        await call.message.answer(
+            "Чек принят без купона, но уведомить пользователя не удалось "
+            "(возможно, он заблокировал бота).",
+            reply_markup=menu,
+        )
+
+
+@dp.callback_query(F.data.in_({"accept_coupon_yes", "accept_coupon_no"}))
+async def admin_accept_coupon_stale(call: CallbackQuery):
+    await call.answer("Эта кнопка уже не активна.", show_alert=True)
 
 
 @dp.message(StateFilter(AdminForm.waiting_coupon), IsModerator())
@@ -1137,10 +1229,17 @@ async def admin_moderation_accept_finish(message: Message, state: FSMContext):
     try:
         accept_text_template = google_sheets.get_text("accept_message")
         try:
-            accept_text = accept_text_template.format(coupon=coupon)
+            accept_text = accept_text_template.format(
+                coupon=coupon,
+                upd_number=receipt.get("upd_number", ""),
+                receipt_date=receipt.get("receipt_date", ""),
+            )
         except Exception:
-            logger.exception("Не удалось подставить купон в шаблон сообщения, использую текст по умолчанию")
-            accept_text = f"Ваш чек принят! Ваш купон Ozon: {coupon}"
+            logger.exception("Не удалось подставить данные в шаблон сообщения, использую текст по умолчанию")
+            accept_text = (
+                f"Ваш купон № {coupon} по УПД № {receipt.get('upd_number', '')} "
+                f"от {receipt.get('receipt_date', '')}"
+            )
 
         await bot.send_message(int(receipt["telegram_id"]), accept_text)
         await message.answer("Купон отправлен пользователю, статус обновлён.", reply_markup=_menu_for(message.from_user.id))
@@ -1553,12 +1652,14 @@ async def admin_coupons_send_yes(call: CallbackQuery, state: FSMContext):
     sent = 0
     not_found = []
     failed = []
+    log_rows = []
 
     for row in coupon_rows:
         username = row["username"]
         telegram_id = google_sheets.get_telegram_id_by_username(username)
         if not telegram_id:
             not_found.append(username)
+            log_rows.append([username, "", row["coupon"], row["nominal"], "username не найден"])
             continue
 
         try:
@@ -1569,9 +1670,16 @@ async def admin_coupons_send_yes(call: CallbackQuery, state: FSMContext):
         try:
             await bot.send_message(int(telegram_id), text)
             sent += 1
+            log_rows.append([username, telegram_id, row["coupon"], row["nominal"], "отправлено"])
         except Exception:
             logger.exception("Не удалось отправить купон пользователю @%s", username)
             failed.append(username)
+            log_rows.append([username, telegram_id, row["coupon"], row["nominal"], "ошибка отправки"])
+
+    try:
+        google_sheets.append_coupons_log(log_rows)
+    except Exception:
+        logger.exception("Не удалось записать лог рассылки купонов в Google Таблицу")
 
     summary = [f"Готово. Отправлено: {sent} из {len(coupon_rows)}."]
     if not_found:
@@ -1711,6 +1819,15 @@ def _build_report_workbook() -> io.BytesIO:
         ws_promo.append([item["article"], item["name"]])
     _autosize(ws_promo, promo_headers)
 
+    ws_coupons = wb.create_sheet("Купоны")
+    coupons_headers = ["Дата отправки", "Username", "Telegram ID", "Купон", "Номинал", "Статус"]
+    ws_coupons.append(coupons_headers)
+    for c in google_sheets.get_coupons_log():
+        ws_coupons.append([
+            c["sent_date"], c["username"], c["telegram_id"], c["coupon"], c["nominal"], c["status"],
+        ])
+    _autosize(ws_coupons, coupons_headers)
+
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -1835,7 +1952,7 @@ def _build_sales_match_workbook(start_date: date, end_date: date):
     # в саму Google Таблицу и гадать.
     sales_by_upd = {}
     for s in google_sheets.get_sales_report():
-        upd = s["upd_number"].strip()
+        upd = google_sheets.normalize_upd(s["upd_number"])
         inn_s = s["inn"].strip()
         sale_date = _parse_date_loose(s["sale_date"])
         if upd:
@@ -1886,7 +2003,7 @@ def _build_sales_match_workbook(start_date: date, end_date: date):
             continue
 
         inn = (reg.get("inn") or "").strip() if reg else ""
-        upd_number = r["upd_number"].strip()
+        upd_number = google_sheets.normalize_upd(r["upd_number"])
 
         if not inn:
             unmatched.append((r, reg, "у пользователя не указан ИНН магазина", ""))
@@ -1997,7 +2114,7 @@ def _build_user_report_workbook(start_date: date, end_date: date):
         sale_date = _parse_date_loose(s["sale_date"])
         if not sale_date:
             continue
-        key = (s["inn"].strip(), s["upd_number"].strip(), sale_date)
+        key = (s["inn"].strip(), google_sheets.normalize_upd(s["upd_number"]), sale_date)
         sales_index.setdefault(key, []).append(s)
 
     # (telegram_id, артикул, цена) -> накопленные данные по позиции
@@ -2016,7 +2133,7 @@ def _build_user_report_workbook(start_date: date, end_date: date):
         if not inn:
             continue
 
-        sale_lines = sales_index.get((inn, r["upd_number"].strip(), receipt_date), [])
+        sale_lines = sales_index.get((inn, google_sheets.normalize_upd(r["upd_number"]), receipt_date), [])
 
         for s in sale_lines:
             article = s["article"].strip()
